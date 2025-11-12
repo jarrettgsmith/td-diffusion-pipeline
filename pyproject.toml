@@ -1,0 +1,72 @@
+[project]
+name = "touchdesigner-diffusion-pipeline"
+version = "1.0.0"
+description = "Spout-based diffusion pipeline for TouchDesigner integration"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch>=2.6.0",  # Will pull from pytorch-cuda index
+    "torchvision>=0.21.0",
+    "xformers>=0.0.29",  # Memory-efficient transformers
+    "accelerate>=1.11.0",
+    "diffusers>=0.35.2",
+    "transformers>=4.55.4",
+    "safetensors>=0.6.2",
+    "huggingface-hub>=0.36.0",
+    "pillow>=11.3.0",
+    "numpy>=2.0.0,<2.3.0",  # Compatible with opencv-python
+    "opencv-python>=4.12.0",
+    "opencv-python-headless>=4.12.0",
+    "pyyaml>=6.0.3",
+    "tqdm>=4.67.1",
+    "requests>=2.32.5",
+    "regex>=2025.10.23",
+    "filelock>=3.19.1",
+    "fsspec>=2025.9.0",
+    "packaging>=25.0",
+    "typing-extensions>=4.15.0",
+    "coloredlogs>=15.0.1",
+    "humanfriendly>=10.0",
+    "python-osc>=1.9.3",
+    "psutil>=7.1.2",
+    "pyopengl>=3.1.10",
+    "pyopengl-accelerate>=3.1.10",
+    "spoutgl>=0.1.1",  # For Spout video streaming on Windows
+]
+
+[project.optional-dependencies]
+onnx = [
+    "onnx>=1.19.1",
+    "onnxruntime-gpu>=1.23.2",
+    "optimum>=2.0.0",
+    "optimum-onnx>=0.0.3",
+]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+prerelease = "if-necessary"
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+torchvision = { index = "pytorch-cuda" }
+xformers = { index = "pytorch-cuda" }
+
+[tool.uv.pip]
+index-url = "https://pypi.org/simple"
+extra-index-url = ["https://download.pytorch.org/whl/cu124"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
