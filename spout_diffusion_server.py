@@ -644,7 +644,8 @@ class SpoutDiffusionServer:
                 for output_image in self.pipe.stream_generate(
                     prompt=self.current_prompt,
                     image=pil_frame,
-                    strength=effective_strength
+                    strength=effective_strength,
+                    seed=self.seed if self.deterministic else None
                 ):
                     # Convert back to numpy array
                     output_array = np.array(output_image, dtype=np.uint8)

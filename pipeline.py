@@ -748,6 +748,7 @@ class StreamDiffusionPipeline:
         prompt: str,
         image: Optional[Union[Image.Image, torch.Tensor]] = None,
         strength: float = 0.8,
+        seed: Optional[int] = None,
         **kwargs
     ):
         """
@@ -761,6 +762,12 @@ class StreamDiffusionPipeline:
                 yield result
             return
         
+        # Create generator for deterministic random number generation
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(seed)
+        
         # Encode prompt once
         prompt_embeds, negative_embeds = self.encode_prompt(prompt)
         
@@ -773,9 +780,9 @@ class StreamDiffusionPipeline:
         # Prepare latents
         if image is not None:
             latents = self._encode_image(image)
-            latents = self._add_noise(latents, strength)
+            latents = self._add_noise(latents, strength, generator=generator)
         else:
-            latents = self._prepare_latents()
+            latents = self._prepare_latents(generator=generator)
             
         # Setup timesteps based on model
         timesteps = self._get_timesteps(strength if image else 1.0)
@@ -1021,7 +1028,7 @@ class StreamDiffusionPipeline:
             
             return Image.fromarray(image)
         
-    def _prepare_latents(self) -> torch.Tensor:
+    def _prepare_latents(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """Prepare initial random latents"""
         # VAE downsamples by 8x (spatial scaling, not the scaling_factor config)
         vae_scale_factor = 8  # Standard VAE downsampling
@@ -1033,7 +1040,7 @@ class StreamDiffusionPipeline:
             self.config.width // vae_scale_factor,
         )
         
-        latents = torch.randn(shape, device=self.device, dtype=self.dtype)
+        latents = torch.randn(shape, device=self.device, dtype=self.dtype, generator=generator)
         
         # Make sure scheduler timesteps are set before accessing init_noise_sigma
         self.scheduler.set_timesteps(self.config.num_inference_steps)
@@ -1041,9 +1048,10 @@ class StreamDiffusionPipeline:
         
         return latents
         
-    def _add_noise(self, latents: torch.Tensor, strength: float) -> torch.Tensor:
+    def _add_noise(self, latents: torch.Tensor, strength: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """Add noise to latents for image-to-image"""
-        noise = torch.randn_like(latents)
+        # randn_like doesn't support generator, so use randn with same shape
+        noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
         
         # Set timesteps first (use cached version)
         if f"{self.config.num_inference_steps}_1.0" not in self.scheduler_cache:
