@@ -301,6 +301,7 @@ class SpoutDiffusionServer:
         disp.map("/prompt", self.handle_prompt)
         disp.map("/strength", self.handle_strength)
         disp.map("/steps", self.handle_steps)
+        disp.map("/guidance", self.handle_guidance)
         disp.map("/precision", self.handle_precision)
         disp.map("/performance", self.handle_performance_mode)
         # Temporal blending controls
@@ -413,6 +414,16 @@ class SpoutDiffusionServer:
         if hasattr(self.pipe, 'config'):
             self.pipe.config.num_inference_steps = new_steps
         print(f"OSC: Steps updated: {new_steps}")
+    
+    def handle_guidance(self, unused_addr, guidance):
+        """Handle OSC guidance scale updates"""
+        try:
+            guidance_val = float(guidance)
+            if hasattr(self.pipe, 'config'):
+                self.pipe.config.guidance_scale = guidance_val
+            print(f"OSC: Guidance scale updated: {guidance_val}")
+        except Exception:
+            print(f"OSC: Invalid /guidance '{guidance}', expected float")
     
     def handle_precision(self, unused_addr, precision):
         """Handle OSC precision updates (16 or 32)"""
@@ -889,6 +900,7 @@ def main():
     parser.add_argument('--osc-port', type=int, default=9998, help='OSC control port')
     parser.add_argument('--steps', type=int, default=default_steps, help='Inference steps')
     parser.add_argument('--strength', type=float, default=default_strength, help='Default strength')
+    parser.add_argument('--guidance', type=float, help='Guidance scale (0=no guidance, 7.5=typical, 20=max)')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 precision (faster, may reduce quality)')
     parser.add_argument('--fp32', action='store_true', help='Force FP32 precision (slower, higher quality)')
     parser.add_argument('--no-optimizations', action='store_true', help='Disable performance optimizations')
@@ -936,7 +948,11 @@ def main():
     
     # Determine model type
     model_type = "sd15" if ("sd-turbo" in args.model.lower() or "stable-diffusion-v1" in args.model.lower()) else "sdxl_turbo" if "sdxl-turbo" in args.model.lower() else "sdxl"
-    guidance_scale = 0.0 if "turbo" in args.model.lower() else 7.5
+    # Use provided guidance or default based on model type
+    if args.guidance is not None:
+        guidance_scale = args.guidance
+    else:
+        guidance_scale = 0.0 if "turbo" in args.model.lower() else 7.5
     
     # Create and run server
     server = SpoutDiffusionServer(

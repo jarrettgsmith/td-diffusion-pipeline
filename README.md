@@ -77,6 +77,9 @@ uv run python spout_diffusion_server.py --steps 4
 # Set default strength
 uv run python spout_diffusion_server.py --strength 0.5
 
+# Set guidance scale (prompt adherence)
+uv run python spout_diffusion_server.py --guidance 7.5
+
 # Enable frame blending (smooth transitions)
 uv run python spout_diffusion_server.py --blend-frames 10
 uv run python spout_diffusion_server.py --blend-time 0.5
@@ -96,6 +99,7 @@ The server accepts OSC commands on port 9998 (by default):
 - `/prompt "your text"` - Set generation prompt
 - `/strength 0.5` - Set image influence (0.0-1.0)
 - `/steps 4` - Set inference steps
+- `/guidance 7.5` - Set guidance scale (0=no guidance, 7.5=typical, 20=strict)
 - `/performance fast|balanced|quality` - Change performance mode
 - `/deterministic 0|1` - Toggle deterministic mode
 - `/seed 123` - Set random seed (for deterministic mode)
