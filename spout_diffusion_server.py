@@ -49,8 +49,8 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 class SpoutDiffusionServer:
-    def __init__(self, model_id, input_sender="PythonOut", output_sender="TouchIn", 
-                 osc_port=9998, model_type="sd15", inference_steps=4, guidance_scale=0.0,
+    def __init__(self, input_sender="PythonOut", output_sender="TouchIn", 
+                 osc_port=9998, inference_steps=1, 
                  use_fp16=None, enable_optimizations=True,
                  deterministic=False, seed: int = 42,
                  acceleration: str | None = None,
@@ -59,7 +59,8 @@ class SpoutDiffusionServer:
                  blend_frames_init: int | None = None,
                  blend_time_init: float | None = None):
         
-        self.model_id = model_id
+        # Hardcoded to SD-Turbo for optimal performance
+        self.model_id = "stabilityai/sd-turbo"
         self.input_sender = input_sender
         self.output_sender = output_sender
         self.osc_port = osc_port
@@ -143,8 +144,8 @@ class SpoutDiffusionServer:
             except Exception:
                 pass
         
-        # Load diffusion pipeline with performance optimizations
-        print(f"Loading diffusion model: {model_id}")
+        # Load SD-Turbo pipeline with optimal settings
+        print(f"Loading SD-Turbo model: {self.model_id}")
         try:
             # Auto-detect optimal precision if not specified
             if use_fp16 is None:
@@ -170,15 +171,15 @@ class SpoutDiffusionServer:
             use_compile = acceleration_type == "torch_compile"
                 
             self.pipe = create_pipeline(
-                model_id=model_id,
-                model_type=model_type,
+                model_id=self.model_id,
+                model_type="sd_turbo",
                 num_inference_steps=inference_steps,
-                guidance_scale=guidance_scale,
+                guidance_scale=0.0,  # SD-Turbo doesn't use guidance
                 use_fp16=use_fp16,
                 acceleration=acceleration_type if enable_optimizations else "none",
                 use_channels_last=enable_optimizations,
-                compile_unet=use_compile,  # Enable UNet compilation
-                compile_vae=False,   # Disable VAE compilation for stability
+                compile_unet=use_compile,
+                compile_vae=False,
                 width=width if isinstance(width, int) and width > 0 else 512,
                 height=height if isinstance(height, int) and height > 0 else 512,
             )
@@ -217,7 +218,7 @@ class SpoutDiffusionServer:
         print(f"Spout Diffusion Server Ready:")
         print(f"  Spout Input: '{input_sender}' -> Spout Output: '{output_sender}'")
         print(f"  OSC Control: localhost:{osc_port}")
-        print(f"  Model: {model_id} ({'Loaded' if self.pipe else 'Pass-through mode'})")
+        print(f"  Model: SD-Turbo ({'Loaded' if self.pipe else 'Pass-through mode'})")
         print()
         print("TouchDesigner Setup:")
         print(f"  1. Add Spout Out TOP - set Sender Name: '{input_sender}'")
@@ -354,9 +355,8 @@ class SpoutDiffusionServer:
                 return
             self.deterministic = enable
             if enable:
-                print("OSC: Deterministic ON - disabling TF32/xFormers and enforcing deterministic algos")
+                print("OSC: Deterministic ON - SD-Turbo deterministic mode enabled")
                 try:
-                    # Strict reproducibility settings
                     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
                     torch.backends.cudnn.deterministic = True
                     torch.backends.cudnn.benchmark = False
@@ -367,11 +367,10 @@ class SpoutDiffusionServer:
                     torch.use_deterministic_algorithms(True)
                 except Exception:
                     pass
-                # Disable memory-efficient attention
                 if self.pipe is not None:
                     self._configure_deterministic_attention()
             else:
-                print("OSC: Deterministic OFF - enabling fast kernels (TF32, cudnn.benchmark). xFormers if available.")
+                print("OSC: Deterministic OFF - SD-Turbo speed optimizations enabled")
                 try:
                     if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
                         torch.backends.cuda.matmul.allow_tf32 = True
@@ -381,7 +380,6 @@ class SpoutDiffusionServer:
                     torch.backends.cudnn.benchmark = True
                 except Exception:
                     pass
-                # Try enabling xFormers attention for speed
                 try:
                     if self.pipe is not None and hasattr(self.pipe, '_enable_xformers'):
                         self.pipe._enable_xformers()
@@ -451,14 +449,9 @@ class SpoutDiffusionServer:
             return
             
         if self.performance_mode == "fast":
-            # Fastest settings - may reduce quality slightly
+            # SD-Turbo fast mode: 1 step for maximum speed
             if hasattr(self.pipe, 'config'):
-                # Prefer 1 step for SD-Turbo, 2 for others
-                model_lower = self.model_id.lower()
-                if "sd-turbo" in model_lower:
-                    self.pipe.config.num_inference_steps = 1
-                else:
-                    self.pipe.config.num_inference_steps = min(2, self.pipe.config.num_inference_steps)
+                self.pipe.config.num_inference_steps = 1
             # Enable speed-oriented settings only when not in deterministic mode
             if not self.deterministic:
                 try:
@@ -483,9 +476,9 @@ class SpoutDiffusionServer:
             # Default balanced settings
             pass  # Keep current settings
         elif self.performance_mode == "quality":
-            # Higher quality settings - slower
+            # SD-Turbo quality mode: 4 steps for best quality
             if hasattr(self.pipe, 'config'):
-                self.pipe.config.num_inference_steps = max(4, self.pipe.config.num_inference_steps)
+                self.pipe.config.num_inference_steps = 4
         
         print(f"Applied {self.performance_mode} performance mode")
 
@@ -641,15 +634,15 @@ class SpoutDiffusionServer:
                 # Convert to PIL Image (uses view when possible)
                 pil_frame = Image.fromarray(frame_rgb)
                 
-                # Apply model-specific parameter mapping (from working server)
-                effective_strength, actual_steps = self._map_parameters_for_model(
+                # SD-Turbo parameter mapping - allow OSC step control
+                effective_strength, recommended_steps = self._map_parameters_for_model(
                     self.current_strength, 
                     self.pipe.config.num_inference_steps
                 )
                 
-                # Update pipeline steps if changed
-                if hasattr(self.pipe, 'config') and self.pipe.config.num_inference_steps != actual_steps:
-                    self.pipe.config.num_inference_steps = actual_steps
+                # Update pipeline steps if changed (OSC control)
+                if hasattr(self.pipe, 'config') and self.pipe.config.num_inference_steps != recommended_steps:
+                    self.pipe.config.num_inference_steps = recommended_steps
                 
                 # Process with diffusion pipeline
                 for output_image in self.pipe.stream_generate(
@@ -715,38 +708,22 @@ class SpoutDiffusionServer:
             return frame_data
     
     def _map_parameters_for_model(self, client_strength, client_steps):
-        """Map strength/steps to model-appropriate ranges (from working server)"""
-        model_lower = self.model_id.lower()
+        """SD-Turbo parameter mapping - supports 1-4 steps via OSC"""
+        # SD-Turbo optimal range: 1-4 steps
+        recommended_steps = max(1, min(4, client_steps))
         
-        if "sd-turbo" in model_lower:
-            # SD-Turbo: 1-4 steps optimal; allow 1-step for max speed
-            recommended_steps = max(1, min(4, client_steps))
-            min_strength = 1.0 / recommended_steps
-            max_strength = 1.0
-        elif "sdxl-turbo" in model_lower:
-            # SDXL-Turbo: 1-4 steps, very sensitive to strength
-            recommended_steps = max(1, min(4, client_steps))
-            min_strength = 1.0 / recommended_steps if recommended_steps > 1 else 0.1
-            max_strength = 1.0
-        elif "sdxl" in model_lower:
-            # SDXL Base: 4-10 steps optimal, higher strength tolerance
-            recommended_steps = max(4, min(10, client_steps))
-            min_strength = max(0.3, 1.0 / recommended_steps)  # SDXL needs higher minimum
+        # SD-Turbo strength mapping based on steps
+        if recommended_steps == 1:
+            # 1-step needs higher minimum strength for visible changes
+            min_strength = 0.3
             max_strength = 1.0
         else:
-            # SD 1.5 and others: standard mapping
-            recommended_steps = max(4, min(8, client_steps))
-            min_strength = 1.0 / recommended_steps
+            # Multi-step can use lower minimum
+            min_strength = 0.1  
             max_strength = 1.0
         
-        # Map strength 0-1 to model-appropriate range
+        # Map client strength to effective range
         effective_strength = min_strength + client_strength * (max_strength - min_strength)
-        
-        # Ensure we always get at least 1 timestep
-        mapped_timesteps = int(recommended_steps * effective_strength)
-        if mapped_timesteps < 1:
-            mapped_timesteps = 1
-            effective_strength = 1.0 / recommended_steps
         
         return effective_strength, recommended_steps
     
@@ -893,8 +870,8 @@ def main():
         default_steps = 4
         default_strength = 0.4
     
-    parser = argparse.ArgumentParser(description='Spout-based TouchDesigner Diffusion Server')
-    parser.add_argument('--model', default=default_model, help='Diffusion model to use')
+    parser = argparse.ArgumentParser(description='SD-Turbo TouchDesigner Spout Server')
+    # Remove --model argument since we're hardcoded to SD-Turbo
     parser.add_argument('--input', default='PythonOut', help='Input Spout sender name')
     parser.add_argument('--output', default='TouchIn', help='Output Spout sender name')
     parser.add_argument('--osc-port', type=int, default=9998, help='OSC control port')
@@ -919,9 +896,9 @@ def main():
     args = parser.parse_args()
     
     print("=" * 60)
-    print("SPOUT DIFFUSION SERVER")
+    print("SD-TURBO SPOUT SERVER")
     print("=" * 60)
-    print(f"Model: {args.model}")
+    print(f"Model: SD-Turbo (stabilityai/sd-turbo)")
     print(f"Spout Input: '{args.input}' -> Output: '{args.output}'")
     print(f"OSC Control Port: {args.osc_port}")
     print(f"CUDA Available: {torch.cuda.is_available()}")
@@ -946,23 +923,16 @@ def main():
     print(f"Deterministic: {'ON' if args.deterministic else 'OFF'} (seed={args.seed})")
     print()
     
-    # Determine model type
-    model_type = "sd15" if ("sd-turbo" in args.model.lower() or "stable-diffusion-v1" in args.model.lower()) else "sdxl_turbo" if "sdxl-turbo" in args.model.lower() else "sdxl"
-    # Use provided guidance or default based on model type
-    if args.guidance is not None:
-        guidance_scale = args.guidance
-    else:
-        guidance_scale = 0.0 if "turbo" in args.model.lower() else 7.5
+    # Hardcoded SD-Turbo configuration
+    model_type = "sd_turbo"
+    guidance_scale = 0.0  # SD-Turbo doesn't use guidance
     
-    # Create and run server
+    # Create and run SD-Turbo server
     server = SpoutDiffusionServer(
-        model_id=args.model,
         input_sender=args.input,
         output_sender=args.output,
         osc_port=args.osc_port,
-        model_type=model_type,
         inference_steps=args.steps,
-        guidance_scale=guidance_scale,
         use_fp16=use_fp16,
         enable_optimizations=enable_optimizations,
         deterministic=args.deterministic,

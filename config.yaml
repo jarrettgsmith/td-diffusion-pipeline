@@ -1,90 +1,61 @@
+# SD-Turbo Optimized Configuration
 diffusion:
-  acceleration: xformers
-  guidance_scale: 0.0
-  height: 512
+  # Hardcoded to SD-Turbo for optimal performance
   model_id: stabilityai/sd-turbo
   model_type: sd_turbo
-  negative_prompt: ''
-  presets:
-    lcm_dreamshaper_low:
-      model_id: SimianLuo/LCM_Dreamshaper_v7
-      prompt: dreamlike subtle enhancement
-      steps: 4
-      strength: 0.25
-    openjourney_low:
-      model_id: prompthero/openjourney
-      prompt: mdjrny-v4 style subtle
-      steps: 20
-      strength: 0.3
-    playground_v25_low:
-      model_id: playgroundai/playground-v2.5-1024px-aesthetic
-      prompt: aesthetic subtle
-      steps: 25
-      strength: 0.3
-    sd15_low:
-      model_id: runwayml/stable-diffusion-v1-5
-      prompt: subtle transformation
-      steps: 30
-      strength: 0.3
-    sd_turbo_high:
-      model_id: stabilityai/sd-turbo
-      prompt: high quality artistic transformation
-      steps: 4
-      strength: 0.5
-    sd_turbo_low:
-      model_id: stabilityai/sd-turbo
-      prompt: subtle enhancement
-      steps: 4
-      strength: 0.25
-    sd_turbo_medium:
-      model_id: stabilityai/sd-turbo
-      prompt: balanced enhancement with artistic flair
-      steps: 2
-      strength: 0.4
-    sdxl_base_high:
-      model_id: stabilityai/stable-diffusion-xl-base-1.0
-      prompt: strong artistic transformation
-      steps: 25
-      strength: 0.8
-    sdxl_base_low:
-      model_id: stabilityai/stable-diffusion-xl-base-1.0
-      prompt: high quality subtle
-      steps: 25
-      strength: 0.3
-    sdxl_base_medium:
-      model_id: stabilityai/stable-diffusion-xl-base-1.0
-      prompt: high quality transformation
-      steps: 25
-      strength: 0.6
-    sdxl_lightning_2step_low:
-      model_id: ByteDance/SDXL-Lightning
-      prompt: ultra fast subtle
-      steps: 2
-      strength: 0.2
-    sdxl_lightning_4step_low:
-      model_id: ByteDance/SDXL-Lightning
-      prompt: lightning fast subtle
-      steps: 4
-      strength: 0.25
-    sdxl_turbo_high:
-      model_id: stabilityai/sdxl-turbo
-      prompt: strong artistic transformation
-      steps: 4
-      strength: 0.8
-    sdxl_turbo_low:
-      model_id: stabilityai/sdxl-turbo
-      prompt: subtle artistic style
-      steps: 4
-      strength: 0.3
-  prompt: high quality artistic
-  scheduler: DPMSolverMultistepScheduler
-  steps: 4
-  strength: 0.5
+  acceleration: xformers
+  
+  # SD-Turbo optimal settings
+  guidance_scale: 0.0  # SD-Turbo doesn't use guidance
+  steps: 1            # Optimal for speed (1-4 supported, controllable via OSC)
+  strength: 0.5       # Good default, controllable via OSC
+  scheduler: EulerAncestralDiscreteScheduler
+  
+  # Resolution settings
   width: 512
+  height: 512
+  
+  # Default prompt and settings
+  prompt: high quality artistic enhancement
+  negative_prompt: ''
+  
+  # SD-Turbo performance presets (controllable via OSC)
+  presets:
+    subtle:
+      prompt: subtle artistic enhancement
+      steps: 1
+      strength: 0.3
+    balanced:
+      prompt: balanced artistic transformation
+      steps: 1
+      strength: 0.5
+    strong:
+      prompt: strong artistic transformation
+      steps: 1
+      strength: 0.8
+    multi_step:
+      prompt: high quality detailed transformation
+      steps: 4
+      strength: 0.6
+
 paths:
   server_script: spout_diffusion_server.py
+
 python:
   venv: .venv
+
+# Server settings
 server:
   host: localhost
   port: 9999
+  
+# OSC Control settings
+osc:
+  port: 9998
+  # Available OSC commands:
+  # /prompt "your prompt here"
+  # /strength 0.5
+  # /steps 1
+  # /guidance 0.0
+  # /deterministic 1
+  # /seed 42

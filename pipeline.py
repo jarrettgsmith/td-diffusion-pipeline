@@ -77,30 +77,22 @@ class AccelerationType(Enum):
 
 
 class ModelType(Enum):
-    """Supported model architectures"""
-    SD15 = "sd15"
-    SD21 = "sd21" 
-    SDXL = "sdxl"
-    SDXL_TURBO = "sdxl_turbo"
-    SDXL_LIGHTNING = "sdxl_lightning"
-    LCM = "lcm"
-    PIXART = "pixart"
-    PLAYGROUND = "playground"
-    FLUX = "flux"
+    """SD-Turbo only"""
+    SD_TURBO = "sd_turbo"
 
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the diffusion pipeline"""
-    model_id: str
-    model_type: ModelType = ModelType.SDXL
+    """SD-Turbo optimized configuration"""
+    model_id: str = "stabilityai/sd-turbo"
+    model_type: ModelType = ModelType.SD_TURBO
     
-    # Performance
+    # SD-Turbo optimal settings
     width: int = 512
     height: int = 512
     batch_size: int = 1
-    num_inference_steps: int = 4
-    guidance_scale: float = 1.0
+    num_inference_steps: int = 1  # SD-Turbo optimized for 1-step
+    guidance_scale: float = 0.0   # SD-Turbo doesn't use guidance
     
     # Optimization
     acceleration: AccelerationType = AccelerationType.NONE
@@ -114,8 +106,8 @@ class PipelineConfig:
     warmup_steps: int = 3
     use_cached_attn: bool = True
     
-    # Scheduler
-    scheduler_type: str = "lcm"  # lcm, ddim, dpm, euler, etc.
+    # Scheduler - SD-Turbo uses Euler Ancestral
+    scheduler_type: str = "euler_a"
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -123,8 +115,8 @@ class PipelineConfig:
 
 class StreamDiffusionPipeline:
     """
-    Clean streaming diffusion pipeline with modular design.
-    Supports latest models and optional TensorRT acceleration.
+    SD-Turbo optimized streaming diffusion pipeline.
+    Simplified for maximum performance with SD-Turbo only.
     """
     
     def __init__(self, config: PipelineConfig):
@@ -161,6 +153,9 @@ class StreamDiffusionPipeline:
         self.scheduler_cache = {}  # Cache for timesteps
         self.vae_precision_set = False  # Track if VAE precision is pre-allocated
         
+        # SD-Turbo optimizations
+        self._last_num_steps = None
+        
         # ONNX mode
         self.onnx_mode = False
         self.onnx_pipe = None
@@ -185,37 +180,24 @@ class StreamDiffusionPipeline:
             DiffusionPipeline
         )
         
-        # Load base pipeline to get components
-        if self.config.model_type in [ModelType.SDXL, ModelType.SDXL_TURBO, ModelType.SDXL_LIGHTNING]:
-            from diffusers import StableDiffusionXLPipeline
-            base_pipe = StableDiffusionXLPipeline.from_pretrained(
-                self.config.model_id,
-                torch_dtype=self.dtype,
-                use_safetensors=True,
-                variant="fp16" if self.config.use_fp16 else None,
-            )
-        else:
-            from diffusers import StableDiffusionPipeline
-            base_pipe = StableDiffusionPipeline.from_pretrained(
-                self.config.model_id,
-                torch_dtype=self.dtype,
-                use_safetensors=True,
-            )
+        # Load SD-Turbo pipeline
+        from diffusers import StableDiffusionPipeline
+        base_pipe = StableDiffusionPipeline.from_pretrained(
+            self.config.model_id,
+            torch_dtype=self.dtype,
+            use_safetensors=True,
+        )
             
-        # Extract components
+        # Extract SD-Turbo components
         self.vae = base_pipe.vae
         self.unet = base_pipe.unet  
         self.text_encoder = base_pipe.text_encoder
-        
-        if hasattr(base_pipe, 'text_encoder_2'):
-            self.text_encoder_2 = base_pipe.text_encoder_2
+        self.text_encoder_2 = None  # SD-Turbo uses single encoder
             
         # Move to device
         self.vae = self.vae.to(self.device)
         self.unet = self.unet.to(self.device)
         self.text_encoder = self.text_encoder.to(self.device)
-        if self.text_encoder_2:
-            self.text_encoder_2 = self.text_encoder_2.to(self.device)
             
         # Setup scheduler
         self._setup_scheduler(base_pipe.scheduler)
@@ -337,23 +319,11 @@ class StreamDiffusionPipeline:
             "euler_a": EulerAncestralDiscreteScheduler,
         }
         
-        # Special handling for turbo/lightning models
-        if self.config.model_type == ModelType.SDXL_TURBO:
-            self.scheduler = EulerAncestralDiscreteScheduler.from_config(
-                base_scheduler.config,
-                timestep_spacing="trailing",
-            )
-        elif self.config.model_type == ModelType.SDXL_LIGHTNING:
-            self.scheduler = DPMSolverMultistepScheduler.from_config(
-                base_scheduler.config,
-                use_karras_sigmas=True,
-            )
-        elif self.config.scheduler_type in scheduler_map:
-            scheduler_class = scheduler_map[self.config.scheduler_type]
-            self.scheduler = scheduler_class.from_config(base_scheduler.config)
-        else:
-            # Use the original scheduler from the model (usually PNDM for SD 1.5)
-            self.scheduler = base_scheduler
+        # SD-Turbo optimized scheduler
+        self.scheduler = EulerAncestralDiscreteScheduler.from_config(
+            base_scheduler.config,
+            timestep_spacing="trailing",
+        )
             
     def _apply_optimizations(self):
         """Apply selected optimizations to the pipeline"""
@@ -522,225 +492,77 @@ class StreamDiffusionPipeline:
         
     @torch.no_grad()
     def encode_prompt(self, prompt: str, negative_prompt: str = ""):
-        """Encode text prompt to embeddings"""
+        """Encode text prompt to embeddings for SD-Turbo with caching"""
+        # Cache key for prompt embeddings
+        cache_key = f"{prompt}|{negative_prompt}"
+        if cache_key in self.text_embedding_cache:
+            return self.text_embedding_cache[cache_key]
         
-        if self.config.model_type in [ModelType.SDXL, ModelType.SDXL_TURBO, ModelType.SDXL_LIGHTNING]:
-            # SDXL uses dual text encoders
-            return self._encode_prompt_sdxl(prompt, negative_prompt)
-        else:
-            # Standard encoding
-            return self._encode_prompt_standard(prompt, negative_prompt)
+        embeddings = self._encode_prompt_standard(prompt, negative_prompt)
+        
+        # Cache the result (limit cache size to prevent memory issues)
+        if len(self.text_embedding_cache) < 100:  # Limit cache size
+            self.text_embedding_cache[cache_key] = embeddings
+        
+        return embeddings
             
     def _encode_prompt_standard(self, prompt: str, negative_prompt: str):
-        """Standard prompt encoding for SD 1.5/2.1"""
-        # Use the pipeline's tokenizer directly
-        if hasattr(self, '_tokenizer'):
-            tokenizer = self._tokenizer
-        else:
+        """SD-Turbo optimized prompt encoding"""
+        # Use cached tokenizer for better performance
+        if not hasattr(self, '_tokenizer'):
             from transformers import CLIPTokenizer
-            tokenizer = CLIPTokenizer.from_pretrained(
+            self._tokenizer = CLIPTokenizer.from_pretrained(
                 self.config.model_id,
                 subfolder="tokenizer"
             )
-            self._tokenizer = tokenizer
         
-        # Tokenize positive prompt
+        tokenizer = self._tokenizer
+        max_length = 77  # Standard CLIP max length
+        
+        # Tokenize and encode positive prompt
         text_inputs = tokenizer(
             prompt,
             padding="max_length",
-            max_length=tokenizer.model_max_length,
+            max_length=max_length,
             truncation=True,
             return_tensors="pt",
         )
         
-        # Encode positive prompt
         text_input_ids = text_inputs.input_ids.to(self.device)
-        prompt_embeds = self.text_encoder(text_input_ids)[0]
+        with torch.no_grad():
+            prompt_embeds = self.text_encoder(text_input_ids)[0]
         
-        # Handle negative prompt
+        # SD-Turbo typically doesn't use negative prompts, but keep for flexibility
         if negative_prompt and negative_prompt.strip():
             negative_inputs = tokenizer(
                 negative_prompt,
                 padding="max_length", 
-                max_length=tokenizer.model_max_length,
+                max_length=max_length,
                 truncation=True,
                 return_tensors="pt",
             )
             negative_input_ids = negative_inputs.input_ids.to(self.device)
-            negative_prompt_embeds = self.text_encoder(negative_input_ids)[0]
+            with torch.no_grad():
+                negative_prompt_embeds = self.text_encoder(negative_input_ids)[0]
         else:
-            # Create uncond embeddings by encoding empty string
-            uncond_inputs = tokenizer(
-                "",
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            uncond_input_ids = uncond_inputs.input_ids.to(self.device)
-            negative_prompt_embeds = self.text_encoder(uncond_input_ids)[0]
-        
-        # Return separate embeddings - we'll concatenate them in the generation loop
-        return prompt_embeds, negative_prompt_embeds
-        
-    def _encode_prompt_sdxl(self, prompt: str, negative_prompt: str):
-        """SDXL prompt encoding with dual encoders"""
-        
-        try:
-            from transformers import CLIPTokenizer
-            
-            # Get both tokenizers - use cached ones if available
-            if not hasattr(self, '_tokenizer'):
-                self._tokenizer = CLIPTokenizer.from_pretrained(
-                    self.config.model_id,
-                    subfolder="tokenizer"
-                )
-            if not hasattr(self, '_tokenizer_2'):
-                self._tokenizer_2 = CLIPTokenizer.from_pretrained(
-                    self.config.model_id, 
-                    subfolder="tokenizer_2"
-                )
-            
-            tokenizer = self._tokenizer
-            tokenizer_2 = self._tokenizer_2
-            
-            # Encode with first text encoder (CLIP-ViT-L/14)
-            max_length = 77
-            text_inputs = tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids.to(self.device)
-            
-            with torch.no_grad():
-                encoder_output_1 = self.text_encoder(text_input_ids)
-                prompt_embeds_1 = encoder_output_1.last_hidden_state  # [batch, 77, 768]
-            
-            # Encode with second text encoder (CLIP-ViT-bigG/14) 
-            text_inputs_2 = tokenizer_2(
-                prompt,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids_2 = text_inputs_2.input_ids.to(self.device)
-            
-            with torch.no_grad():
-                if self.text_encoder_2:
-                    encoder_output_2 = self.text_encoder_2(text_input_ids_2)
-                    prompt_embeds_2 = encoder_output_2.last_hidden_state  # [batch, 77, 1280]
-                    # Extract pooled embeddings from second encoder for added_cond_kwargs
-                    # For CLIP models, pooled embedding is usually the [CLS] token (first token)
-                    if hasattr(encoder_output_2, 'pooler_output'):
-                        pooled_prompt_embeds = encoder_output_2.pooler_output  # [batch, 1280]
-                    else:
-                        # Alternative: use first token of last hidden state
-                        pooled_prompt_embeds = encoder_output_2.last_hidden_state[:, 0, :]  # [batch, 1280]
-                else:
-                    # Fallback if second encoder not available
-                    prompt_embeds_2 = torch.zeros(prompt_embeds_1.shape[0], 77, 1280).to(self.device, self.dtype)
-                    pooled_prompt_embeds = torch.zeros(prompt_embeds_1.shape[0], 1280).to(self.device, self.dtype)
-            
-            # Concatenate embeddings: 768 + 1280 = 2048
-            prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)
-            
-            # Handle negative prompt similarly
-            if negative_prompt and negative_prompt.strip():
+            # For SD-Turbo, we typically use unconditional embeddings
+            if not hasattr(self, '_cached_uncond_embeds'):
                 uncond_inputs = tokenizer(
-                    negative_prompt,
+                    "",
                     padding="max_length",
                     max_length=max_length,
                     truncation=True,
                     return_tensors="pt",
                 )
                 uncond_input_ids = uncond_inputs.input_ids.to(self.device)
-                
-                uncond_inputs_2 = tokenizer_2(
-                    negative_prompt,
-                    padding="max_length",
-                    max_length=max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                uncond_input_ids_2 = uncond_inputs_2.input_ids.to(self.device)
-                
                 with torch.no_grad():
-                    uncond_output_1 = self.text_encoder(uncond_input_ids)
-                    negative_embeds_1 = uncond_output_1.last_hidden_state
-                    
-                    if self.text_encoder_2:
-                        uncond_output_2 = self.text_encoder_2(uncond_input_ids_2)
-                        negative_embeds_2 = uncond_output_2.last_hidden_state
-                        if hasattr(uncond_output_2, 'pooler_output'):
-                            pooled_negative_embeds = uncond_output_2.pooler_output
-                        else:
-                            pooled_negative_embeds = uncond_output_2.last_hidden_state[:, 0, :]
-                    else:
-                        negative_embeds_2 = torch.zeros(negative_embeds_1.shape[0], 77, 1280).to(self.device, self.dtype)
-                        pooled_negative_embeds = torch.zeros(negative_embeds_1.shape[0], 1280).to(self.device, self.dtype)
-                    
-                    negative_embeds = torch.cat([negative_embeds_1, negative_embeds_2], dim=-1)
-            else:
-                # Create uncond embeddings by encoding empty string
-                empty_inputs = tokenizer(
-                    "",
-                    padding="max_length",
-                    max_length=max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                empty_input_ids = empty_inputs.input_ids.to(self.device)
-                
-                empty_inputs_2 = tokenizer_2(
-                    "",
-                    padding="max_length",
-                    max_length=max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                empty_input_ids_2 = empty_inputs_2.input_ids.to(self.device)
-                
-                with torch.no_grad():
-                    empty_output_1 = self.text_encoder(empty_input_ids)
-                    negative_embeds_1 = empty_output_1.last_hidden_state
-                    
-                    if self.text_encoder_2:
-                        empty_output_2 = self.text_encoder_2(empty_input_ids_2)
-                        negative_embeds_2 = empty_output_2.last_hidden_state
-                        if hasattr(empty_output_2, 'pooler_output'):
-                            pooled_negative_embeds = empty_output_2.pooler_output
-                        else:
-                            pooled_negative_embeds = empty_output_2.last_hidden_state[:, 0, :]
-                    else:
-                        negative_embeds_2 = torch.zeros(negative_embeds_1.shape[0], 77, 1280).to(self.device, self.dtype)
-                        pooled_negative_embeds = torch.zeros(negative_embeds_1.shape[0], 1280).to(self.device, self.dtype)
-                    
-                    negative_embeds = torch.cat([negative_embeds_1, negative_embeds_2], dim=-1)
+                    self._cached_uncond_embeds = self.text_encoder(uncond_input_ids)[0]
             
-            # Store pooled embeddings for added_cond_kwargs
-            self._pooled_prompt_embeds = pooled_prompt_embeds
-            self._pooled_negative_embeds = pooled_negative_embeds
-                
-            return prompt_embeds, negative_embeds
-            
-        except Exception as e:
-            print(f"SDXL encoding error: {e}, using fallback")
-            # Fallback: Create embeddings with correct SDXL dimensions
-            batch_size = self.config.batch_size
-            
-            # SDXL expects concatenated embeddings: 768 + 1280 = 2048
-            prompt_embeds = torch.randn(batch_size, 77, 2048).to(self.device, self.dtype) * 0.1
-            negative_embeds = torch.zeros_like(prompt_embeds)
-            
-            # Create dummy pooled embeddings
-            self._pooled_prompt_embeds = torch.randn(batch_size, 1280).to(self.device, self.dtype) * 0.1
-            self._pooled_negative_embeds = torch.zeros_like(self._pooled_prompt_embeds)
-            
-            return prompt_embeds, negative_embeds
+            negative_prompt_embeds = self._cached_uncond_embeds
+        
+        return prompt_embeds, negative_prompt_embeds
+        
+    # REMOVED: SDXL dual encoder complexity - not needed for SD-Turbo
         
     @torch.no_grad()
     def stream_generate(
@@ -801,37 +623,8 @@ class StreamDiffusionPipeline:
             
             # Predict noise residual
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                # Prepare additional conditioning for SDXL models
+                # SD-Turbo doesn't need additional conditioning
                 added_cond_kwargs = {}
-                if self.config.model_type in [ModelType.SDXL, ModelType.SDXL_TURBO, ModelType.SDXL_LIGHTNING]:
-                    # SDXL requires additional conditioning - use real pooled embeddings
-                    batch_size = latent_model_input.shape[0]
-                    
-                    # Use real pooled embeddings from text encoding
-                    if hasattr(self, '_pooled_prompt_embeds') and hasattr(self, '_pooled_negative_embeds'):
-                        if self.config.guidance_scale > 1.0:
-                            # For CFG, concatenate negative and positive pooled embeddings
-                            text_embeds = torch.cat([self._pooled_negative_embeds, self._pooled_prompt_embeds])
-                        else:
-                            # No CFG, just use positive embeddings
-                            text_embeds = self._pooled_prompt_embeds
-                            # Make sure batch size matches latent_model_input
-                            if text_embeds.shape[0] != batch_size:
-                                text_embeds = text_embeds.repeat(batch_size, 1)
-                    else:
-                        # Fallback if pooled embeddings not available
-                        text_embeds = torch.randn(batch_size, 1280).to(self.device, self.dtype)
-                    
-                    # Calculate proper time_ids based on actual image dimensions
-                    # Format: [original_width, original_height, crop_x, crop_y, target_width, target_height]
-                    time_ids = torch.tensor([
-                        [self.config.width, self.config.height, 0, 0, self.config.width, self.config.height]
-                    ]).repeat(batch_size, 1).to(self.device, self.dtype)
-                    
-                    added_cond_kwargs = {
-                        "text_embeds": text_embeds,
-                        "time_ids": time_ids
-                    }
                 
                 # Validate tensors before UNet call (debug mode)
                 validation_tensors = {
@@ -955,23 +748,9 @@ class StreamDiffusionPipeline:
         # Normalize to [-1, 1]
         image = 2.0 * image - 1.0
         
-        # For SDXL, use float32 VAE encode to avoid precision issues (same as decode)
-        if self.config.model_type in [ModelType.SDXL, ModelType.SDXL_TURBO, ModelType.SDXL_LIGHTNING]:
-            # Convert VAE to float32 temporarily
-            original_vae_dtype = next(self.vae.parameters()).dtype
-            self.vae = self.vae.float()
-            image_f32 = image.float()
-            
-            try:
-                with torch.no_grad():
-                    latents = self.vae.encode(image_f32).latent_dist.sample()
-            finally:
-                # Convert VAE back to original dtype
-                self.vae = self.vae.to(dtype=original_vae_dtype)
-        else:
-            # Standard encode for non-SDXL models
-            with torch.no_grad():
-                latents = self.vae.encode(image).latent_dist.sample()
+        # SD-Turbo standard VAE encoding
+        with torch.no_grad():
+            latents = self.vae.encode(image).latent_dist.sample()
         
         scaling_factor = getattr(self.vae.config, 'scaling_factor', 0.18215)
         latents = latents * float(scaling_factor)
@@ -988,32 +767,17 @@ class StreamDiffusionPipeline:
             # Ensure latents are in correct format for VAE
             latents = latents.contiguous()
             
-            # For SDXL only, use float32 VAE decode to avoid precision issues
-            # SD Turbo works better with default VAE precision
-            if self.config.model_type in [ModelType.SDXL, ModelType.SDXL_TURBO, ModelType.SDXL_LIGHTNING]:
-                # Convert VAE to float32 temporarily
-                original_vae_dtype = next(self.vae.parameters()).dtype
-                self.vae = self.vae.float()
-                latents_f32 = latents.float()
-                
+            # SD-Turbo optimized VAE decoding
+            if self.compiled_vae:
                 try:
-                    with torch.no_grad():
-                        image = self.vae.decode(latents_f32).sample
-                finally:
-                    # Convert VAE back to original dtype
-                    self.vae = self.vae.to(dtype=original_vae_dtype)
-            else:
-                # Standard decode for non-SDXL models
-                if self.compiled_vae:
-                    try:
-                        image = self.compiled_vae(latents)
-                    except Exception as e:
-                        print(f"Compiled VAE failed, using standard VAE: {e}")
-                        with torch.no_grad():
-                            image = self.vae.decode(latents).sample
-                else:
+                    image = self.compiled_vae(latents)
+                except Exception as e:
+                    print(f"Compiled VAE failed, using standard VAE: {e}")
                     with torch.no_grad():
                         image = self.vae.decode(latents).sample
+            else:
+                with torch.no_grad():
+                    image = self.vae.decode(latents).sample
             
             # Convert to PIL
             image = (image / 2 + 0.5).clamp(0, 1)
@@ -1042,8 +806,10 @@ class StreamDiffusionPipeline:
         
         latents = torch.randn(shape, device=self.device, dtype=self.dtype, generator=generator)
         
-        # Make sure scheduler timesteps are set before accessing init_noise_sigma
-        self.scheduler.set_timesteps(self.config.num_inference_steps)
+        # Only set timesteps if they changed to avoid expensive recreation
+        if self._last_num_steps != self.config.num_inference_steps:
+            self.scheduler.set_timesteps(self.config.num_inference_steps)
+            self._last_num_steps = self.config.num_inference_steps
         latents = latents * self.scheduler.init_noise_sigma
         
         return latents
@@ -1053,9 +819,10 @@ class StreamDiffusionPipeline:
         # randn_like doesn't support generator, so use randn with same shape
         noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
         
-        # Set timesteps first (use cached version)
-        if f"{self.config.num_inference_steps}_1.0" not in self.scheduler_cache:
+        # Only set timesteps if they changed to avoid expensive recreation
+        if self._last_num_steps != self.config.num_inference_steps:
             self.scheduler.set_timesteps(self.config.num_inference_steps)
+            self._last_num_steps = self.config.num_inference_steps
         
         # Calculate how many denoising steps to skip based on strength
         init_timestep = min(int(self.config.num_inference_steps * strength), self.config.num_inference_steps)
@@ -1096,7 +863,9 @@ class StreamDiffusionPipeline:
         
     def _get_timesteps(self, strength: float) -> torch.Tensor:
         """Get timesteps based on scheduler and strength"""
+        # Always set timesteps to ensure scheduler state is correct
         self.scheduler.set_timesteps(self.config.num_inference_steps)
+        self._last_num_steps = self.config.num_inference_steps
         
         if strength < 1.0:
             # For image-to-image, skip some timesteps
