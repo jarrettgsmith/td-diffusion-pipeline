@@ -39,22 +39,9 @@ For 100% reproducible outputs with the same prompt + frame + seed:
 uv run python spout_diffusion_server.py --deterministic --seed 42
 ```
 
-### Performance Modes
+### Performance
 
-**Fast mode** (lowest latency, may reduce quality):
-```bash
-uv run python spout_diffusion_server.py --performance fast
-```
-
-**Quality mode** (best results, slower):
-```bash
-uv run python spout_diffusion_server.py --performance quality
-```
-
-**Balanced mode** (default):
-```bash
-uv run python spout_diffusion_server.py --performance balanced
-```
+The minimal server targets SD‑Turbo with low latency. For maximum speed, prefer FP16 on CUDA and keep steps low (1–4).
 
 ### Advanced Options
 
@@ -68,8 +55,7 @@ uv run python spout_diffusion_server.py --fp32
 # Disable all optimizations (for debugging)
 uv run python spout_diffusion_server.py --no-optimizations
 
-# Custom model
-uv run python spout_diffusion_server.py --model stabilityai/sdxl-turbo
+# Model is fixed to SD‑Turbo in the minimal server
 
 # Set inference steps
 uv run python spout_diffusion_server.py --steps 4
@@ -77,12 +63,7 @@ uv run python spout_diffusion_server.py --steps 4
 # Set default strength
 uv run python spout_diffusion_server.py --strength 0.5
 
-# Set guidance scale (prompt adherence)
-uv run python spout_diffusion_server.py --guidance 7.5
-
-# Enable frame blending (smooth transitions)
-uv run python spout_diffusion_server.py --blend-frames 10
-uv run python spout_diffusion_server.py --blend-time 0.5
+# (SD‑Turbo ignores guidance by default)
 
 # Custom Spout names
 uv run python spout_diffusion_server.py --input PythonOut --output TouchIn
@@ -95,17 +76,12 @@ uv run python spout_diffusion_server.py --osc-port 9998
 
 The server accepts OSC commands on port 9998 (by default):
 
-### Live Controls
+### Live Controls (minimal)
 - `/prompt "your text"` - Set generation prompt
-- `/strength 0.5` - Set image influence (0.0-1.0)
-- `/steps 4` - Set inference steps
-- `/guidance 7.5` - Set guidance scale (0=no guidance, 7.5=typical, 20=strict)
-- `/performance fast|balanced|quality` - Change performance mode
-- `/deterministic 0|1` - Toggle deterministic mode
-- `/seed 123` - Set random seed (for deterministic mode)
-- `/blendframes 10` - Set frame blending count
-- `/blendtime 0.5` - Set time-based blending (seconds)
-- `/blendreset` - Reset blending state
+- `/strength 0.5` - Set image influence (0.0–1.0)
+- `/steps 1` - Set inference steps (1–4 recommended)
+- `/seed 123` - Set random seed (effective in deterministic mode)
+  
 
 ## Configuration
 

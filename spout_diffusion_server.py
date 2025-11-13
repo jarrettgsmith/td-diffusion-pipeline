@@ -25,16 +25,13 @@ import time
 import array
 from itertools import repeat
 import numpy as np
-import cv2
 import torch
-from PIL import Image
 import argparse
 import threading
 import queue
 import signal
 import gc
 import random
-import hashlib
 from pythonosc import dispatcher
 from pythonosc import osc_server
 import SpoutGL
@@ -43,7 +40,7 @@ import OpenGL.GL as GL
 
 # Import existing pipeline components
 from pipeline import create_pipeline
-from config_loader import get_config
+# from config_loader import get_config  # Not used in minimal build
 
 # Global flag for clean shutdown
 running = True
@@ -63,8 +60,7 @@ class SpoutDiffusionServer:
                  acceleration: str | None = None,
                  width: int | None = None,
                  height: int | None = None,
-                 blend_frames_init: int | None = None,
-                 blend_time_init: float | None = None):
+                 compile_vae: bool = False):
         
         # Hardcoded to SD-Turbo for optimal performance
         self.model_id = "stabilityai/sd-turbo"
@@ -88,7 +84,7 @@ class SpoutDiffusionServer:
         
         # Processing state
         self.current_prompt = ""
-        self.current_negative_prompt = ""
+        # Minimal: no negative prompt handling
         self.current_strength = 0.4
         self.running = True
         
@@ -109,37 +105,15 @@ class SpoutDiffusionServer:
         self.timing_enabled = False  # Set to True for detailed timing
         self.timing_data = {}
         
-        # Performance settings
+        # Performance settings (minimal)
         self.use_fp16 = use_fp16
         self.enable_optimizations = enable_optimizations
-        self.performance_mode = "balanced"  # Can be: fast, balanced, quality
         
         # Determinism settings
         self.deterministic = bool(deterministic)
         self.seed = int(seed)
 
-        # Content-based caching (same input + params -> same output)
-        self._last_signature = None
-        self._last_output_bytes = None
-
-        # Temporal blending controls/state
-        self.blend_frames = 10            # frames to blend between changes (0 disables)
-        self.blend_time_sec = 0.0         # if >0, use time-based blending instead of frames
-        self._blend = {
-            "active": False,
-            "idx": 0,
-            "total": 0,
-            "start_rgb": None,   # uint8 (H,W,3)
-            "target_rgb": None,  # uint8 (H,W,3)
-        }
-        self._active_signature = None     # signature we are currently blending toward
-        self.fps_ema = 0.0                # FPS estimate for time->frames
-        self._prev_time = time.time()
-        # Override initial blending from CLI if provided
-        if isinstance(blend_frames_init, int):
-            self.blend_frames = max(0, min(int(blend_frames_init), 600))
-        if isinstance(blend_time_init, (int, float)):
-            self.blend_time_sec = max(0.0, min(float(blend_time_init), 30.0))
+        # Blending and signature caching removed for simplicity
         
         # Apply global determinism environment early if requested
         if self.deterministic:
@@ -172,16 +146,9 @@ class SpoutDiffusionServer:
             if use_fp16 is None:
                 use_fp16 = torch.cuda.is_available()  # Default to FP16 on CUDA
             
-            # Determine acceleration setting (CLI overrides config)
-            try:
-                if acceleration is not None:
-                    acceleration_type = str(acceleration)
-                else:
-                    config = get_config()
-                    acceleration_type = config.get('diffusion', {}).get('acceleration', 'xformers')
-                print(f"Using acceleration: {acceleration_type}")
-            except Exception:
-                acceleration_type = "xformers"  # Fallback
+            # Determine acceleration setting (no external config)
+            acceleration_type = str(acceleration) if acceleration is not None else "xformers"
+            print(f"Using acceleration: {acceleration_type}")
             
             # Allow optimizations in video-deterministic mode for better performance
             if self.deterministic and acceleration_type.lower() in ["torch_compile"]:
@@ -201,7 +168,7 @@ class SpoutDiffusionServer:
                 acceleration=acceleration_type if enable_optimizations else "none",
                 use_channels_last=enable_optimizations,
                 compile_unet=use_compile,
-                compile_vae=False,
+                compile_vae=bool(compile_vae),
                 width=width if isinstance(width, int) and width > 0 else 512,
                 height=height if isinstance(height, int) and height > 0 else 512,
             )
@@ -210,9 +177,14 @@ class SpoutDiffusionServer:
             print(f"  Acceleration: {acceleration_type}")
             print(f"  Precision: {'FP16' if use_fp16 else 'FP32'}")
             print(f"  Optimizations: {'Enabled' if enable_optimizations else 'Disabled'}")
-            if use_compile:
-                print(f"  torch.compile: UNet and VAE compilation enabled")
-                print(f"  NOTE: First inference will be slower due to compilation (~30s)")
+            if use_compile or compile_vae:
+                compiled_parts = []
+                if use_compile:
+                    compiled_parts.append("UNet")
+                if compile_vae:
+                    compiled_parts.append("VAE")
+                print(f"  torch.compile: {' and '.join(compiled_parts)} compilation enabled")
+                print(f"  NOTE: First inference may be slower due to compilation")
             
         except Exception as e:
             print(f"Failed to load diffusion pipeline: {e}")
@@ -246,9 +218,9 @@ class SpoutDiffusionServer:
         print(f"  1. Add Spout Out TOP - set Sender Name: '{input_sender}'")
         print(f"  2. Add OSC Out DAT - set Network Address: localhost:{osc_port}")
         print(f"  3. Add Spout In TOP - set Spout Name: '{output_sender}'")
-        print(f"  4. Send OSC: /prompt 'your prompt', /negative 'bad quality', /strength 0.5, /steps 4")
-        print(f"  5. Control: /seed 42, /precision 16, /performance fast")
-        print(f"  6. Advanced: Try --acceleration torch_compile, or lower resolution --width 448 --height 448")
+        print(f"  4. Send OSC: /prompt 'your prompt', /strength 0.5, /steps 1")
+        print(f"  5. Control: /seed 42")
+        print(f"  6. Advanced: --acceleration torch_compile, or lower resolution --width 448 --height 448")
         if self.deterministic:
             print(f"  7. Deterministic mode: ENABLED (seed changes via /seed)")
         else:
@@ -327,16 +299,9 @@ class SpoutDiffusionServer:
         """Setup OSC server for parameter control"""
         disp = dispatcher.Dispatcher()
         disp.map("/prompt", self.handle_prompt)
-        disp.map("/negative", self.handle_negative_prompt)
         disp.map("/strength", self.handle_strength)
         disp.map("/steps", self.handle_steps)
-        disp.map("/guidance", self.handle_guidance)
-        disp.map("/precision", self.handle_precision)
-        disp.map("/performance", self.handle_performance_mode)
-        # Temporal blending controls
-        disp.map("/blendframes", self.handle_blend_frames)
-        disp.map("/blendtime", self.handle_blend_time)
-        disp.map("/blendreset", self.handle_blend_reset)
+        # Minimal set: prompt, strength, steps, seed
         # Seed control (deterministic mode must be set at startup)
         disp.map("/seed", self.handle_seed)
         
@@ -346,31 +311,7 @@ class SpoutDiffusionServer:
         self.osc_thread.start()
         print(f"OSC server listening on port {self.osc_port}")
 
-    # Temporal blending OSC handlers
-    def handle_blend_frames(self, unused_addr, frames):
-        try:
-            n = int(frames)
-            self.blend_frames = max(0, min(n, 600))
-            print(f"OSC: Blend frames set to {self.blend_frames}")
-        except Exception:
-            print(f"OSC: Invalid /blendframes '{frames}', expected integer")
-
-    def handle_blend_time(self, unused_addr, seconds):
-        try:
-            t = float(seconds)
-            self.blend_time_sec = max(0.0, min(t, 30.0))
-            mode = "time" if self.blend_time_sec > 0 else "frames"
-            print(f"OSC: Blend time set to {self.blend_time_sec:.2f}s (mode={mode})")
-        except Exception:
-            print(f"OSC: Invalid /blendtime '{seconds}', expected float seconds")
-
-    def handle_blend_reset(self, unused_addr, *_):
-        self._blend["active"] = False
-        self._blend["idx"] = 0
-        self._blend["total"] = 0
-        self._blend["start_rgb"] = None
-        self._blend["target_rgb"] = None
-        print("OSC: Blend reset")
+    # Blending handlers removed
 
     # Seed control handler
 
@@ -387,10 +328,6 @@ class SpoutDiffusionServer:
         self.current_prompt = str(prompt)
         print(f"OSC: Prompt updated: '{self.current_prompt[:50]}...'")
     
-    def handle_negative_prompt(self, unused_addr, negative_prompt):
-        """Handle OSC negative prompt updates"""
-        self.current_negative_prompt = str(negative_prompt)
-        print(f"OSC: Negative prompt updated: '{self.current_negative_prompt[:50]}...'")
     
     def handle_strength(self, unused_addr, strength):
         """Handle OSC strength updates"""
@@ -404,74 +341,7 @@ class SpoutDiffusionServer:
             self.pipe.config.num_inference_steps = new_steps
         print(f"OSC: Steps updated: {new_steps}")
     
-    def handle_guidance(self, unused_addr, guidance):
-        """Handle OSC guidance scale updates"""
-        try:
-            guidance_val = float(guidance)
-            if hasattr(self.pipe, 'config'):
-                self.pipe.config.guidance_scale = guidance_val
-            print(f"OSC: Guidance scale updated: {guidance_val}")
-        except Exception:
-            print(f"OSC: Invalid /guidance '{guidance}', expected float")
-    
-    def handle_precision(self, unused_addr, precision):
-        """Handle OSC precision updates (16 or 32)"""
-        precision_val = int(precision)
-        if precision_val == 16:
-            print("OSC: Switching to FP16 precision - restart server to apply")
-        elif precision_val == 32:
-            print("OSC: Switching to FP32 precision - restart server to apply")
-        else:
-            print(f"OSC: Invalid precision {precision_val}, use 16 or 32")
-    
-    def handle_performance_mode(self, unused_addr, mode):
-        """Handle OSC performance mode updates"""
-        mode_str = str(mode).lower()
-        if mode_str in ["fast", "balanced", "quality"]:
-            self.performance_mode = mode_str
-            print(f"OSC: Performance mode: {mode_str}")
-            self._apply_performance_mode()
-        else:
-            print(f"OSC: Invalid mode '{mode_str}', use: fast, balanced, quality")
-    
-    def _apply_performance_mode(self):
-        """Apply performance mode settings"""
-        if not self.pipe:
-            return
-            
-        if self.performance_mode == "fast":
-            # SD-Turbo fast mode: 1 step for maximum speed
-            if hasattr(self.pipe, 'config'):
-                self.pipe.config.num_inference_steps = 1
-            # Enable speed-oriented settings only when not in deterministic mode
-            if not self.deterministic:
-                try:
-                    # Prefer faster matmul/cuDNN paths when allowed
-                    if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
-                        torch.backends.cuda.matmul.allow_tf32 = True
-                    if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
-                        torch.backends.cudnn.allow_tf32 = True
-                    torch.use_deterministic_algorithms(False)
-                    torch.backends.cudnn.benchmark = True
-                except Exception:
-                    pass
-                # Try enabling xFormers for memory-efficient attention
-                try:
-                    if hasattr(self.pipe, '_enable_xformers'):
-                        self.pipe._enable_xformers()
-                except Exception as e:
-                    print(f"Could not enable xFormers in FAST mode: {e}")
-            else:
-                print("FAST mode active, but keeping deterministic constraints (no TF32/xFormers)")
-        elif self.performance_mode == "balanced":
-            # Default balanced settings
-            pass  # Keep current settings
-        elif self.performance_mode == "quality":
-            # SD-Turbo quality mode: 4 steps for best quality
-            if hasattr(self.pipe, 'config'):
-                self.pipe.config.num_inference_steps = 4
-        
-        print(f"Applied {self.performance_mode} performance mode")
+    # Removed: negative prompt, guidance, precision, performance mode handlers for minimal build
 
     def _reset_rng(self):
         """Reset RNGs to the configured seed each frame for determinism."""
@@ -544,87 +414,12 @@ class SpoutDiffusionServer:
                 # Convert RGBA to RGB (view, no copy until flip)
                 frame_rgb = frame_array[:, :, :3]
 
-                # FPS EMA for time-based blending estimation
-                now = time.time()
-                dt = max(1e-3, now - getattr(self, "_prev_time", now))
-                inst_fps = 1.0 / dt
-                self.fps_ema = inst_fps if self.fps_ema == 0.0 else (0.9 * self.fps_ema + 0.1 * inst_fps)
-                self._prev_time = now
+                # Blending/caching removed: process every frame directly
 
-                # Determine total blend frames (time overrides frames)
-                if self.blend_time_sec > 0.0:
-                    approx_fps = max(1.0, self.fps_ema if self.fps_ema > 0 else 30.0)
-                    total_blend_frames = int(round(self.blend_time_sec * approx_fps))
-                else:
-                    total_blend_frames = int(self.blend_frames)
-                total_blend_frames = max(0, min(total_blend_frames, 600))
+                # Blending removed
 
-                # Build a fast content+params signature to detect unchanged input
-                try:
-                    h = hashlib.blake2b(digest_size=16)
-                    # Hash frame content as-is (no copies via memoryview)
-                    h.update(memoryview(frame_rgb))
-                    # Include key parameters that affect output
-                    h.update(self.current_prompt.encode('utf-8'))
-                    h.update(str(self.current_strength).encode('utf-8'))
-                    steps_val = getattr(self.pipe.config, 'num_inference_steps', 0)
-                    h.update(str(steps_val).encode('utf-8'))
-                    h.update(str(self.deterministic).encode('utf-8'))
-                    h.update(str(self.seed).encode('utf-8'))
-                    h.update(self.model_id.encode('utf-8'))
-                    signature = (width, height, h.hexdigest())
-                except Exception:
-                    signature = None
-
-                # If mid-blend toward the same signature, emit next blended frame
-                if self._blend["active"] and signature == self._active_signature:
-                    start = self._blend["start_rgb"]
-                    target = self._blend["target_rgb"]
-                    if start is not None and target is not None and start.shape == target.shape == (height, width, 3):
-                        i = self._blend["idx"]
-                        N = max(1, self._blend["total"]) if self._blend["total"] > 0 else max(1, total_blend_frames)
-                        alpha = float(i + 1) / float(N)
-                        blended = cv2.addWeighted(target, alpha, start, 1.0 - alpha, 0.0)
-                        self._blend["idx"] += 1
-                        if self.output_rgba_buffer is None or self.current_buffer_size != (height, width):
-                            self.output_rgba_buffer = np.empty((height, width, 4), dtype=np.uint8)
-                            self.current_buffer_size = (height, width)
-                        self.output_rgba_buffer[:, :, :3] = blended
-                        self.output_rgba_buffer[:, :, 3] = 255
-                        # Finish blend when done; update cache with final target
-                        if self._blend["idx"] >= N:
-                            self._blend["active"] = False
-                            self._blend["idx"] = 0
-                            self._blend["total"] = 0
-                            self._blend["start_rgb"] = None
-                            self._blend["target_rgb"] = None
-                            if self._prev_output_rgb is None or self._prev_output_rgb.shape != target.shape:
-                                self._prev_output_rgb = target.copy()
-                            else:
-                                self._prev_output_rgb[:] = target
-                            final_bytes = self.output_rgba_buffer.tobytes()
-                            # Cache final result once blending completes
-                            self._last_signature = signature
-                            self._last_output_bytes = final_bytes
-                        return self.output_rgba_buffer.tobytes()
-                    else:
-                        # Reset invalid blend state
-                        self._blend["active"] = False
-                        self._blend["idx"] = 0
-                        self._blend["total"] = 0
-                        self._blend["start_rgb"] = None
-                        self._blend["target_rgb"] = None
-
-                # If signature unchanged and we have a cached output, return it
-                if signature is not None and signature == self._last_signature and self._last_output_bytes is not None:
-                    return self._last_output_bytes
-                
                 # OPTIMIZATION: Skip PIL conversion entirely for speed
-                # Convert directly to the format needed by diffusion pipeline
-                # frame_rgb is already the right format (H,W,3) uint8
-                
-                # Create PIL Image without extra copying
-                pil_frame = Image.fromarray(frame_rgb, mode='RGB')
+                # Pass numpy RGB array directly to pipeline
                 
                 # SD-Turbo parameter mapping - allow OSC step control
                 effective_strength, recommended_steps = self._map_parameters_for_model(
@@ -643,13 +438,14 @@ class SpoutDiffusionServer:
                 # Process with diffusion pipeline
                 for output_image in self.pipe.stream_generate(
                     prompt=self.current_prompt,
-                    negative_prompt=self.current_negative_prompt,
-                    image=pil_frame,
+                    negative_prompt="",
+                    image=frame_rgb,
                     strength=effective_strength,
-                    seed=self.seed if self.deterministic else None
+                    seed=self.seed if self.deterministic else None,
+                    return_numpy=True
                 ):
-                    # Convert back to numpy array
-                    output_array = np.array(output_image, dtype=np.uint8)
+                    # Already numpy array (H, W, 3)
+                    output_array = output_image
                     
                     # Flip back for TouchDesigner (in-place when possible)
                     #output_flipped = np.flipud(output_array)
@@ -663,35 +459,7 @@ class SpoutDiffusionServer:
                     self.output_rgba_buffer[:, :, :3] = output_array  # RGB channels
                     self.output_rgba_buffer[:, :, 3] = 255  # Alpha channel
                     
-                    # If new signature and we have previous output and blending enabled, start a blend
-                    if signature != self._active_signature and self._prev_output_rgb is not None and total_blend_frames > 0:
-                        self._active_signature = signature
-                        self._blend["active"] = True
-                        self._blend["idx"] = 0
-                        self._blend["total"] = total_blend_frames
-                        self._blend["start_rgb"] = self._prev_output_rgb.copy()
-                        self._blend["target_rgb"] = output_array.copy()
-                        # Emit first blended frame
-                        N = max(1, self._blend["total"])
-                        alpha = 1.0 / float(N)
-                        blended = cv2.addWeighted(self._blend["target_rgb"], alpha, self._blend["start_rgb"], 1.0 - alpha, 0.0)
-                        self._blend["idx"] += 1
-                        if self.output_rgba_buffer is None or self.current_buffer_size != (height, width):
-                            self.output_rgba_buffer = np.empty((height, width, 4), dtype=np.uint8)
-                            self.current_buffer_size = (height, width)
-                        self.output_rgba_buffer[:, :, :3] = blended
-                        self.output_rgba_buffer[:, :, 3] = 255
-                        return self.output_rgba_buffer.tobytes()
-
-                    # Otherwise, no blending: output target and cache
-                    self._active_signature = signature
-                    self._prev_output_rgb = output_array.copy()
-
-                    # OPTIMIZATION: Return buffer directly instead of tobytes()
-                    # The sender can work with numpy arrays directly
-                    # Cache result for identical subsequent frames/params
-                    self._last_signature = signature
-                    self._last_output_bytes = self.output_rgba_buffer  # Cache buffer not bytes
+                    # Return buffer directly (no blending)
                     return self.output_rgba_buffer
                 
                 # Fallback if no output generated
@@ -761,23 +529,17 @@ class SpoutDiffusionServer:
                 # Convert to numpy (view, no copy)
                 frame_data = np.frombuffer(self.buffer, dtype=np.uint8)
                 
-                # Quick validation (expensive operation - only check occasionally)
-                if self.frame_count % 30 == 0:  # Only check every 30 frames
-                    if np.count_nonzero(frame_data) == 0:
-                        return
-                
                 # Process frame immediately (pass view directly, no copy)
                 processed_data = self.process_frame(frame_data, self.current_width, self.current_height)
                 
                 # Send processed frame immediately (optimized for numpy arrays)
                 if isinstance(processed_data, np.ndarray):
-                    # OPTIMIZATION: Send numpy array directly, only convert to bytes when necessary
-                    send_buffer = processed_data.tobytes() if processed_data.flags['C_CONTIGUOUS'] else np.ascontiguousarray(processed_data).tobytes()
-                elif isinstance(processed_data, bytes):
-                    send_buffer = processed_data  # No copy needed
-                elif hasattr(processed_data, 'data_ptr'):
-                    # Use GPU memory directly if available
-                    send_buffer = processed_data.tobytes()
+                    if processed_data.flags['C_CONTIGUOUS']:
+                        send_buffer = memoryview(processed_data)
+                    else:
+                        send_buffer = memoryview(np.ascontiguousarray(processed_data))
+                elif isinstance(processed_data, (bytes, bytearray, memoryview)):
+                    send_buffer = processed_data
                 else:
                     send_buffer = bytes(processed_data)
                 
@@ -849,35 +611,20 @@ class SpoutDiffusionServer:
         print("Server shutdown complete")
 
 def main():
-    # Load configuration
-    try:
-        config = get_config()
-        diffusion_config = config.get('diffusion', {})
-        server_config = config.get('server', {})
-        
-        default_model = diffusion_config.get('model_id', 'stabilityai/sd-turbo')
-        default_steps = diffusion_config.get('steps', 4)
-        default_strength = diffusion_config.get('strength', 0.4)
-        
-    except Exception as e:
-        print(f"Config loading failed: {e}, using defaults")
-        default_model = 'stabilityai/sd-turbo'
-        default_steps = 4
-        default_strength = 0.4
+    # Minimal defaults
+    default_steps = 1
+    default_strength = 0.4
     
-    parser = argparse.ArgumentParser(description='SD-Turbo TouchDesigner Spout Server')
-    # Remove --model argument since we're hardcoded to SD-Turbo
+    parser = argparse.ArgumentParser(description='SD-Turbo TouchDesigner Spout Server (minimal)')
+    # Hardcoded to SD-Turbo; minimal CLI
     parser.add_argument('--input', default='PythonOut', help='Input Spout sender name')
     parser.add_argument('--output', default='TouchIn', help='Output Spout sender name')
     parser.add_argument('--osc-port', type=int, default=9998, help='OSC control port')
     parser.add_argument('--steps', type=int, default=default_steps, help='Inference steps')
     parser.add_argument('--strength', type=float, default=default_strength, help='Default strength')
-    parser.add_argument('--guidance', type=float, help='Guidance scale (0=no guidance, 7.5=typical, 20=max)')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 precision (faster, may reduce quality)')
     parser.add_argument('--fp32', action='store_true', help='Force FP32 precision (slower, higher quality)')
     parser.add_argument('--no-optimizations', action='store_true', help='Disable performance optimizations')
-    parser.add_argument('--performance', choices=['fast', 'balanced', 'quality'], default='balanced', 
-                        help='Performance mode (fast/balanced/quality)')
     parser.add_argument('--deterministic', action='store_true', help='Enable deterministic output for static inputs')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for deterministic mode')
     # Non-live attributes: set at start
@@ -885,13 +632,12 @@ def main():
                         help='Attention/engine acceleration (non-live)')
     parser.add_argument('--width', type=int, help='Working width for the diffusion pipeline (non-live)')
     parser.add_argument('--height', type=int, help='Working height for the diffusion pipeline (non-live)')
-    parser.add_argument('--blend-frames', type=int, dest='blend_frames', help='Initial blend frames (can still change live)')
-    parser.add_argument('--blend-time', type=float, dest='blend_time', help='Initial blend time in seconds (can still change live)')
+    parser.add_argument('--compile-vae', action='store_true', help='Compile VAE decoder (torch.compile)')
     
     args = parser.parse_args()
     
     print("=" * 60)
-    print("SD-TURBO SPOUT SERVER")
+    print("SD-TURBO SPOUT SERVER (minimal)")
     print("=" * 60)
     print(f"Model: SD-Turbo (stabilityai/sd-turbo)")
     print(f"Spout Input: '{args.input}' -> Output: '{args.output}'")
@@ -914,14 +660,10 @@ def main():
     
     enable_optimizations = not args.no_optimizations
     print(f"Optimizations: {'Enabled' if enable_optimizations else 'Disabled'}")
-    print(f"Performance Mode: {args.performance.title()}")
     print(f"Deterministic: {'ON' if args.deterministic else 'OFF'} (seed={args.seed})")
     print()
     
     # Hardcoded SD-Turbo configuration
-    model_type = "sd_turbo"
-    guidance_scale = 0.0  # SD-Turbo doesn't use guidance
-    
     # Create and run SD-Turbo server
     server = SpoutDiffusionServer(
         input_sender=args.input,
@@ -935,16 +677,12 @@ def main():
         acceleration=args.acceleration,
         width=args.width,
         height=args.height,
-        blend_frames_init=args.blend_frames,
-        blend_time_init=args.blend_time,
+        compile_vae=args.compile_vae,
     )
     
     # Set initial parameters
     server.current_strength = args.strength
     server.current_prompt = "artistic painting, vibrant colors, masterpiece"
-    server.current_negative_prompt = ""  # Start with no negative prompt for max speed
-    server.performance_mode = args.performance
-    server._apply_performance_mode()
     
     server.run()
 

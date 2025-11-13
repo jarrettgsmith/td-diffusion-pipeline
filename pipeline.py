@@ -617,9 +617,10 @@ class StreamDiffusionPipeline:
         self,
         prompt: str,
         negative_prompt: str = "",
-        image: Optional[Union[Image.Image, torch.Tensor]] = None,
+        image: Optional[Union[Image.Image, torch.Tensor, np.ndarray]] = None,
         strength: float = 0.8,
         seed: Optional[int] = None,
+        return_numpy: bool = False,
         **kwargs
     ):
         """
@@ -656,20 +657,43 @@ class StreamDiffusionPipeline:
         else:
             text_embeddings = prompt_embeds
         
-        # Prepare latents
+        # Set timesteps for this generation (must be called every run)
+        self.scheduler.set_timesteps(self.config.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        # Prepare latents (after setting timesteps so init_noise_sigma is valid)
         if image is not None:
+            # Encode image to latents
             latents = self._encode_image(image)
-            latents = self._add_noise(latents, strength, generator=generator)
+            # Proper img2img strength handling: add noise at an initial timestep
+            num = int(self.config.num_inference_steps)
+            s = max(0.0, min(1.0, float(strength)))
+            init_timestep = int(float(num) * s)
+            init_timestep = max(0, min(init_timestep, num))
+            # Standard SD img2img mapping: higher strength -> earlier (noisier) start
+            t_start = num - init_timestep
+            # Ensure we always run at least one denoise step
+            t_start = min(max(0, t_start), max(0, len(timesteps) - 1))
+            t_init = timesteps[t_start]
+            # Ensure timesteps is batched for add_noise (expects iterable per batch item)
+            if isinstance(t_init, torch.Tensor) and t_init.ndim == 0:
+                t_init = t_init.repeat(latents.shape[0])
+            elif not isinstance(t_init, torch.Tensor):
+                t_init = torch.tensor([t_init], device=self.device, dtype=timesteps.dtype)
+            if generator is not None:
+                noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
+            else:
+                noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
+            latents = self.scheduler.add_noise(latents, noise, t_init)
+            # Run from t_start through the full schedule (inclusive)
+            timesteps_to_run = timesteps[t_start:]
         else:
             latents = self._prepare_latents(generator=generator)
-            
-        # Always set timesteps to ensure scheduler internal state is correct
-        # This is needed for EulerAncestralDiscreteScheduler to work properly
-        self.scheduler.set_timesteps(self.config.num_inference_steps)
-        timesteps = self.scheduler.timesteps
+            # Run the full schedule for txt2img
+            timesteps_to_run = timesteps
         
-        # Streaming loop
-        for i, t in enumerate(timesteps):
+        # Streaming loop over selected timesteps (Euler A expects full range for each run)
+        for i, t in enumerate(timesteps_to_run):
             
             # For CFG, duplicate latents to match concatenated embeddings
             if guidance_scale > 1.0:
@@ -746,11 +770,10 @@ class StreamDiffusionPipeline:
             
             # Debug: store last latents
             self._last_latents = latents
-            
-            # Decode and yield intermediate results for streaming
-            if i == len(timesteps) - 1:  # Only yield the final result
-                image = self._decode_latents(latents)
-                yield image
+
+        # After the loop, decode and yield the final result
+        image = self._decode_latents(latents, return_numpy=return_numpy)
+        yield image
     
     def _stream_generate_onnx(self, prompt: str, image: Optional[Image.Image] = None, strength: float = 0.8, **kwargs):
         """ONNX-accelerated generation"""
@@ -799,15 +822,42 @@ class StreamDiffusionPipeline:
             # Fallback to dummy image
             yield Image.new('RGB', (self.config.width, self.config.height), 'red')
                 
-    def _encode_image(self, image: Union[Image.Image, torch.Tensor]) -> torch.Tensor:
+    def _encode_image(self, image: Union[Image.Image, torch.Tensor, np.ndarray]) -> torch.Tensor:
         """Encode image to latent space"""
         if isinstance(image, Image.Image):
-            # Convert PIL to tensor
-            image = np.array(image).astype(np.float32) / 255.0
-            image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
-            
-        image = image.to(self.device, dtype=self.dtype)
-        
+            # Convert PIL to tensor via numpy
+            np_img = np.asarray(image, dtype=np.uint8)
+            tensor = torch.from_numpy(np_img)
+            tensor = tensor.to(dtype=torch.float32).div_(255.0)
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        elif isinstance(image, np.ndarray):
+            # Expect HWC uint8
+            if image.dtype != np.uint8:
+                np_img = image.astype(np.uint8, copy=False)
+            else:
+                np_img = image
+            tensor = torch.from_numpy(np_img)
+            # Convert to float32 and normalize on CPU first
+            tensor = tensor.to(dtype=torch.float32).div_(255.0)
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        else:
+            # Assume it's already a torch.Tensor in CHW or BCHW range [0,1] or [0,255]
+            tensor = image
+
+        # If tensor is uint8 (torch path), convert/normalize
+        if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.uint8:
+            tensor = tensor.to(dtype=torch.float32).div_(255.0)
+
+        # Pin memory for faster H2D when on CUDA
+        non_blocking = self.device.type == "cuda"
+        try:
+            if tensor.device.type == "cpu" and non_blocking:
+                tensor = tensor.pin_memory()
+        except Exception:
+            pass
+
+        image = tensor.to(self.device, dtype=self.dtype, non_blocking=non_blocking)
+
         # Normalize to [-1, 1]
         image = 2.0 * image - 1.0
         
@@ -820,7 +870,7 @@ class StreamDiffusionPipeline:
         
         return latents
         
-    def _decode_latents(self, latents: torch.Tensor) -> Image.Image:
+    def _decode_latents(self, latents: torch.Tensor, return_numpy: bool = False) -> Union[Image.Image, np.ndarray]:
         """Decode latents to image"""
         with torch.no_grad():
             # Scale latents
@@ -852,7 +902,8 @@ class StreamDiffusionPipeline:
                 image = np.nan_to_num(image, nan=0.0)
                 
             image = (image * 255).astype(np.uint8)[0]
-            
+            if return_numpy:
+                return image  # HWC uint8
             return Image.fromarray(image)
         
     def _prepare_latents(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
@@ -869,10 +920,6 @@ class StreamDiffusionPipeline:
         
         latents = torch.randn(shape, device=self.device, dtype=self.dtype, generator=generator)
         
-        # Only set timesteps if they changed to avoid expensive recreation
-        if self._last_num_steps != self.config.num_inference_steps:
-            self.scheduler.set_timesteps(self.config.num_inference_steps)
-            self._last_num_steps = self.config.num_inference_steps
         latents = latents * self.scheduler.init_noise_sigma
         
         return latents
@@ -1005,15 +1052,13 @@ def create_pipeline(
 
 
 if __name__ == "__main__":
-    # Example usage
+    # Minimal example usage for SD‑Turbo
     pipe = create_pipeline(
-        "stabilityai/sdxl-turbo",
-        model_type="sdxl_turbo",
+        model_id="stabilityai/sd-turbo",
+        model_type="sd_turbo",
         width=512,
         height=512,
         num_inference_steps=1,
         acceleration="xformers"
     )
-    
-    # Benchmark
-    pipe.benchmark(num_iterations=5)
+    print("SD‑Turbo pipeline initialized.")
