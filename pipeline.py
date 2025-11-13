@@ -658,43 +658,51 @@ class StreamDiffusionPipeline:
             text_embeddings = prompt_embeds
         
         # Set timesteps for this generation (must be called every run)
-        self.scheduler.set_timesteps(self.config.num_inference_steps, device=self.device)
-        timesteps = self.scheduler.timesteps
+        # Guard against invalid step counts by clamping to at least 1
+        steps = max(1, int(self.config.num_inference_steps))
+        self.scheduler.set_timesteps(steps, device=self.device)
+        local_timesteps = self.scheduler.timesteps
+        # Ensure timesteps is non-empty
+        if isinstance(local_timesteps, torch.Tensor) and local_timesteps.numel() == 0:
+            local_timesteps = torch.tensor([0.0], device=self.device, dtype=torch.float32)
 
         # Prepare latents (after setting timesteps so init_noise_sigma is valid)
         if image is not None:
             # Encode image to latents
             latents = self._encode_image(image)
-            # Proper img2img strength handling: add noise at an initial timestep
-            num = int(self.config.num_inference_steps)
+            # Standard diffusers img2img strength mapping
+            num = steps
             s = max(0.0, min(1.0, float(strength)))
-            init_timestep = int(float(num) * s)
+            init_timestep = int(num * s)
             init_timestep = max(0, min(init_timestep, num))
-            # Standard SD img2img mapping: higher strength -> earlier (noisier) start
-            t_start = num - init_timestep
-            # Ensure we always run at least one denoise step
-            t_start = min(max(0, t_start), max(0, len(timesteps) - 1))
-            t_init = timesteps[t_start]
+            t_start = max(num - init_timestep, 0)
+            # Clamp start to valid range and build run slice; ensure at least one element
+            total = int(local_timesteps.shape[0]) if isinstance(local_timesteps, torch.Tensor) else len(local_timesteps)
+            if t_start >= total:
+                t_start = max(0, total - 1)
+            run_timesteps = local_timesteps[t_start:]
+            if isinstance(run_timesteps, torch.Tensor) and run_timesteps.numel() == 0:
+                run_timesteps = local_timesteps[-1:].clone()
+            # Initial noise sigma for add_noise is the first of the selected timesteps
+            t_init = run_timesteps[0]
             # Ensure timesteps is batched for add_noise (expects iterable per batch item)
             if isinstance(t_init, torch.Tensor) and t_init.ndim == 0:
                 t_init = t_init.repeat(latents.shape[0])
             elif not isinstance(t_init, torch.Tensor):
-                t_init = torch.tensor([t_init], device=self.device, dtype=timesteps.dtype)
+                t_init = torch.tensor([t_init], device=self.device, dtype=local_timesteps.dtype)
             if generator is not None:
                 noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
             else:
                 noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
             latents = self.scheduler.add_noise(latents, noise, t_init)
-            # Run from t_start through the full schedule (inclusive)
-            timesteps_to_run = timesteps[t_start:]
         else:
             latents = self._prepare_latents(generator=generator)
             # Run the full schedule for txt2img
-            timesteps_to_run = timesteps
+            run_timesteps = local_timesteps
         
         # Streaming loop over selected timesteps (Euler A expects full range for each run)
         with torch.inference_mode():
-            for i, t in enumerate(timesteps_to_run):
+            for i, t in enumerate(run_timesteps):
                 # For CFG, duplicate latents to match concatenated embeddings
                 if guidance_scale > 1.0:
                     latent_model_input = torch.cat([latents] * 2)
@@ -709,17 +717,18 @@ class StreamDiffusionPipeline:
                     # SD-Turbo doesn't need additional conditioning
                     added_cond_kwargs = {}
 
+                    t_in = t.to(torch.float32)
                     if self.compiled_unet:
                         noise_pred = self.compiled_unet(
                             latent_model_input,
-                            t.to(self.dtype),
+                            t_in,
                             encoder_hidden_states=text_embeddings,
                             added_cond_kwargs=added_cond_kwargs,
                         ).sample
                     else:
                         noise_pred = self.unet(
                             latent_model_input,
-                            t.to(self.dtype),
+                            t_in,
                             encoder_hidden_states=text_embeddings,
                             added_cond_kwargs=added_cond_kwargs,
                         ).sample
