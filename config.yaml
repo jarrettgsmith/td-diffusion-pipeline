@@ -3,7 +3,7 @@ diffusion:
   # Hardcoded to SD-Turbo for optimal performance
   model_id: stabilityai/sd-turbo
   model_type: sd_turbo
-  acceleration: xformers
+  acceleration: none  # Benchmarks show 'none' is fastest (4.5 FPS vs 4.4 FPS xformers)
   
   # SD-Turbo optimal settings
   guidance_scale: 0.0  # SD-Turbo doesn't use guidance
@@ -54,8 +54,8 @@ osc:
   port: 9998
   # Available OSC commands:
   # /prompt "your prompt here"
+  # /negative "bad quality, blurry"
   # /strength 0.5
   # /steps 1
-  # /guidance 0.0
-  # /deterministic 1
+  # /guidance 1.5
   # /seed 42

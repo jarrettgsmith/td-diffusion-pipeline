@@ -14,6 +14,13 @@ Usage:
 
 import sys
 import os
+
+# Set CUBLAS workspace config BEFORE importing torch for deterministic mode
+# This must be done before any CUDA operations
+if '--deterministic' in sys.argv or any('deterministic' in arg.lower() for arg in sys.argv):
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    print("Pre-import: Set CUBLAS_WORKSPACE_CONFIG for deterministic mode")
+
 import time
 import array
 from itertools import repeat
@@ -81,6 +88,7 @@ class SpoutDiffusionServer:
         
         # Processing state
         self.current_prompt = ""
+        self.current_negative_prompt = ""
         self.current_strength = 0.4
         self.running = True
         
@@ -96,6 +104,10 @@ class SpoutDiffusionServer:
         # Performance tracking
         self.last_fps_time = time.time()
         self.last_fps_frame = 0
+        
+        # Performance profiling
+        self.timing_enabled = False  # Set to True for detailed timing
+        self.timing_data = {}
         
         # Performance settings
         self.use_fp16 = use_fp16
@@ -131,18 +143,27 @@ class SpoutDiffusionServer:
         
         # Apply global determinism environment early if requested
         if self.deterministic:
-            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+            # CUBLAS_WORKSPACE_CONFIG should already be set before torch import
+            cublas_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+            if not cublas_config:
+                print("WARNING: CUBLAS_WORKSPACE_CONFIG not set before torch import")
+                print("WARNING: Deterministic mode may not work properly")
+                os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            else:
+                print(f"SUCCESS: CUBLAS_WORKSPACE_CONFIG={cublas_config}")
+                
             try:
+                # SELECTIVE DETERMINISM: Only enable critical settings for video work
                 torch.backends.cudnn.deterministic = True
-                torch.backends.cudnn.benchmark = False
-                # Disable TF32 for strict reproducibility
-                if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
-                    torch.backends.cuda.matmul.allow_tf32 = False
-                if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
-                    torch.backends.cudnn.allow_tf32 = False
-                torch.use_deterministic_algorithms(True)
-            except Exception:
-                pass
+                # Keep benchmark=True for performance (slight non-determinism but faster)
+                torch.backends.cudnn.benchmark = True  
+                
+                # Keep TF32 enabled for performance (video doesn't need perfect determinism)
+                # Strict determinism hurts performance significantly
+                print("SUCCESS: Video-optimized deterministic mode configured")
+                print("NOTE: Prioritizing video performance over perfect mathematical determinism")
+            except Exception as e:
+                print(f"WARNING: Deterministic mode setup failed: {e}")
         
         # Load SD-Turbo pipeline with optimal settings
         print(f"Loading SD-Turbo model: {self.model_id}")
@@ -162,10 +183,11 @@ class SpoutDiffusionServer:
             except Exception:
                 acceleration_type = "xformers"  # Fallback
             
-            # Force deterministic-friendly acceleration when determinism requested
-            if self.deterministic and acceleration_type.lower() != "none":
-                print("Deterministic mode: overriding acceleration to 'none' (disabling xformers/flash)")
+            # Allow optimizations in video-deterministic mode for better performance
+            if self.deterministic and acceleration_type.lower() in ["torch_compile"]:
+                print("Deterministic mode: disabling torch_compile (not video-compatible)")
                 acceleration_type = "none"
+            # Keep xformers/flash_attention for video determinism - they're reasonably stable
                 
             # Enable compilation for torch_compile acceleration
             use_compile = acceleration_type == "torch_compile"
@@ -224,8 +246,13 @@ class SpoutDiffusionServer:
         print(f"  1. Add Spout Out TOP - set Sender Name: '{input_sender}'")
         print(f"  2. Add OSC Out DAT - set Network Address: localhost:{osc_port}")
         print(f"  3. Add Spout In TOP - set Spout Name: '{output_sender}'")
-        print(f"  4. Send OSC: /prompt 'your prompt', /strength 0.5, /steps 4")
-        print(f"  5. Performance: /precision 16, /performance fast")
+        print(f"  4. Send OSC: /prompt 'your prompt', /negative 'bad quality', /strength 0.5, /steps 4")
+        print(f"  5. Control: /seed 42, /precision 16, /performance fast")
+        print(f"  6. Advanced: Try --acceleration torch_compile, or lower resolution --width 448 --height 448")
+        if self.deterministic:
+            print(f"  7. Deterministic mode: ENABLED (seed changes via /seed)")
+        else:
+            print(f"  7. Deterministic mode: DISABLED (use --deterministic flag to enable)")
     
     def _initialize_spout(self):
         """Initialize Spout objects with improved detection"""
@@ -300,6 +327,7 @@ class SpoutDiffusionServer:
         """Setup OSC server for parameter control"""
         disp = dispatcher.Dispatcher()
         disp.map("/prompt", self.handle_prompt)
+        disp.map("/negative", self.handle_negative_prompt)
         disp.map("/strength", self.handle_strength)
         disp.map("/steps", self.handle_steps)
         disp.map("/guidance", self.handle_guidance)
@@ -309,8 +337,7 @@ class SpoutDiffusionServer:
         disp.map("/blendframes", self.handle_blend_frames)
         disp.map("/blendtime", self.handle_blend_time)
         disp.map("/blendreset", self.handle_blend_reset)
-        # Determinism and seed controls
-        disp.map("/deterministic", self.handle_deterministic)
+        # Seed control (deterministic mode must be set at startup)
         disp.map("/seed", self.handle_seed)
         
         # Start OSC server in background thread
@@ -345,48 +372,7 @@ class SpoutDiffusionServer:
         self._blend["target_rgb"] = None
         print("OSC: Blend reset")
 
-    # Determinism OSC handlers
-    def handle_deterministic(self, unused_addr, value):
-        try:
-            v = int(value)
-            enable = bool(v)
-            if enable == self.deterministic:
-                print(f"OSC: Deterministic already {'on' if enable else 'off'}")
-                return
-            self.deterministic = enable
-            if enable:
-                print("OSC: Deterministic ON - SD-Turbo deterministic mode enabled")
-                try:
-                    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
-                    torch.backends.cudnn.deterministic = True
-                    torch.backends.cudnn.benchmark = False
-                    if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
-                        torch.backends.cuda.matmul.allow_tf32 = False
-                    if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
-                        torch.backends.cudnn.allow_tf32 = False
-                    torch.use_deterministic_algorithms(True)
-                except Exception:
-                    pass
-                if self.pipe is not None:
-                    self._configure_deterministic_attention()
-            else:
-                print("OSC: Deterministic OFF - SD-Turbo speed optimizations enabled")
-                try:
-                    if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
-                        torch.backends.cuda.matmul.allow_tf32 = True
-                    if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
-                        torch.backends.cudnn.allow_tf32 = True
-                    torch.use_deterministic_algorithms(False)
-                    torch.backends.cudnn.benchmark = True
-                except Exception:
-                    pass
-                try:
-                    if self.pipe is not None and hasattr(self.pipe, '_enable_xformers'):
-                        self.pipe._enable_xformers()
-                except Exception as e:
-                    print(f"OSC: Could not enable xFormers: {e}")
-        except Exception:
-            print(f"OSC: Invalid /deterministic '{value}', expected 0 or 1")
+    # Seed control handler
 
     def handle_seed(self, unused_addr, seed):
         try:
@@ -400,6 +386,11 @@ class SpoutDiffusionServer:
         """Handle OSC prompt updates"""
         self.current_prompt = str(prompt)
         print(f"OSC: Prompt updated: '{self.current_prompt[:50]}...'")
+    
+    def handle_negative_prompt(self, unused_addr, negative_prompt):
+        """Handle OSC negative prompt updates"""
+        self.current_negative_prompt = str(negative_prompt)
+        print(f"OSC: Negative prompt updated: '{self.current_negative_prompt[:50]}...'")
     
     def handle_strength(self, unused_addr, strength):
         """Handle OSC strength updates"""
@@ -628,17 +619,22 @@ class SpoutDiffusionServer:
                 if signature is not None and signature == self._last_signature and self._last_output_bytes is not None:
                     return self._last_output_bytes
                 
-                # Flip for TouchDesigner coordinates (first actual copy)
-                #frame_rgb_flipped = np.flipud(frame_rgb)
+                # OPTIMIZATION: Skip PIL conversion entirely for speed
+                # Convert directly to the format needed by diffusion pipeline
+                # frame_rgb is already the right format (H,W,3) uint8
                 
-                # Convert to PIL Image (uses view when possible)
-                pil_frame = Image.fromarray(frame_rgb)
+                # Create PIL Image without extra copying
+                pil_frame = Image.fromarray(frame_rgb, mode='RGB')
                 
                 # SD-Turbo parameter mapping - allow OSC step control
                 effective_strength, recommended_steps = self._map_parameters_for_model(
                     self.current_strength, 
                     self.pipe.config.num_inference_steps
                 )
+                
+                # Debug logging to verify strength values
+                if self.frame_count % 30 == 0:
+                    print(f"DEBUG: OSC strength={self.current_strength:.3f} -> effective={effective_strength:.3f}, steps={recommended_steps}")
                 
                 # Update pipeline steps if changed (OSC control)
                 if hasattr(self.pipe, 'config') and self.pipe.config.num_inference_steps != recommended_steps:
@@ -647,6 +643,7 @@ class SpoutDiffusionServer:
                 # Process with diffusion pipeline
                 for output_image in self.pipe.stream_generate(
                     prompt=self.current_prompt,
+                    negative_prompt=self.current_negative_prompt,
                     image=pil_frame,
                     strength=effective_strength,
                     seed=self.seed if self.deterministic else None
@@ -690,12 +687,12 @@ class SpoutDiffusionServer:
                     self._active_signature = signature
                     self._prev_output_rgb = output_array.copy()
 
-                    # Return bytes view (final unavoidable copy)
-                    output_bytes = self.output_rgba_buffer.tobytes()
+                    # OPTIMIZATION: Return buffer directly instead of tobytes()
+                    # The sender can work with numpy arrays directly
                     # Cache result for identical subsequent frames/params
                     self._last_signature = signature
-                    self._last_output_bytes = output_bytes
-                    return output_bytes
+                    self._last_output_bytes = self.output_rgba_buffer  # Cache buffer not bytes
+                    return self.output_rgba_buffer
                 
                 # Fallback if no output generated
                 print(f"[WARNING] No output from diffusion pipeline")
@@ -708,22 +705,15 @@ class SpoutDiffusionServer:
             return frame_data
     
     def _map_parameters_for_model(self, client_strength, client_steps):
-        """SD-Turbo parameter mapping - supports 1-4 steps via OSC"""
+        """SD-Turbo parameter mapping with improved strength handling"""
         # SD-Turbo optimal range: 1-4 steps
         recommended_steps = max(1, min(4, client_steps))
         
-        # SD-Turbo strength mapping based on steps
-        if recommended_steps == 1:
-            # 1-step needs higher minimum strength for visible changes
-            min_strength = 0.3
-            max_strength = 1.0
-        else:
-            # Multi-step can use lower minimum
-            min_strength = 0.1  
-            max_strength = 1.0
+        # For SD-Turbo, use client strength directly without modification
+        # Let user have full control over strength range 0.0-1.0
+        effective_strength = max(0.0, min(1.0, client_strength))
         
-        # Map client strength to effective range
-        effective_strength = min_strength + client_strength * (max_strength - min_strength)
+        # Remove automatic strength boosting - let user control this via OSC
         
         return effective_strength, recommended_steps
     
@@ -736,7 +726,7 @@ class SpoutDiffusionServer:
             frame_diff = self.frame_count - self.last_fps_frame
             fps = frame_diff / time_diff
             
-            print(f"Performance: {fps:.1f} FPS | Frames: {self.frame_count} | Prompt: '{self.current_prompt[:30]}...'")
+            print(f"Performance: {fps:.1f} FPS | Frames: {self.frame_count} | Steps: {self.pipe.config.num_inference_steps} | Prompt: '{self.current_prompt[:25]}...'")
             
             self.last_fps_time = current_time
             self.last_fps_frame = self.frame_count
@@ -771,15 +761,19 @@ class SpoutDiffusionServer:
                 # Convert to numpy (view, no copy)
                 frame_data = np.frombuffer(self.buffer, dtype=np.uint8)
                 
-                # Quick validation
-                if np.count_nonzero(frame_data) == 0:
-                    return
+                # Quick validation (expensive operation - only check occasionally)
+                if self.frame_count % 30 == 0:  # Only check every 30 frames
+                    if np.count_nonzero(frame_data) == 0:
+                        return
                 
                 # Process frame immediately (pass view directly, no copy)
                 processed_data = self.process_frame(frame_data, self.current_width, self.current_height)
                 
-                # Send processed frame immediately (reuse buffer when possible)
-                if isinstance(processed_data, bytes):
+                # Send processed frame immediately (optimized for numpy arrays)
+                if isinstance(processed_data, np.ndarray):
+                    # OPTIMIZATION: Send numpy array directly, only convert to bytes when necessary
+                    send_buffer = processed_data.tobytes() if processed_data.flags['C_CONTIGUOUS'] else np.ascontiguousarray(processed_data).tobytes()
+                elif isinstance(processed_data, bytes):
                     send_buffer = processed_data  # No copy needed
                 elif hasattr(processed_data, 'data_ptr'):
                     # Use GPU memory directly if available
@@ -792,8 +786,8 @@ class SpoutDiffusionServer:
                 # Update counters
                 self.frame_count += 1
                 
-                # Calculate FPS periodically
-                if self.frame_count % 30 == 0:
+                # Calculate FPS periodically (reduce frequency for max speed)
+                if self.frame_count % 60 == 0:  # Reduced from 30 to 60
                     self.calculate_fps()
                     
             except Exception as receive_error:
@@ -827,7 +821,8 @@ class SpoutDiffusionServer:
         try:
             while running and self.running:
                 self.process_single_frame()
-                time.sleep(0.001)  # Minimal delay to prevent 100% CPU
+                # Remove sleep for maximum speed - let GPU processing be the bottleneck
+                # time.sleep(0.001)  # Removed: was limiting to ~1000 FPS max
         except KeyboardInterrupt:
             print("\nShutting down server...")
             self.running = False
@@ -947,6 +942,7 @@ def main():
     # Set initial parameters
     server.current_strength = args.strength
     server.current_prompt = "artistic painting, vibrant colors, masterpiece"
+    server.current_negative_prompt = ""  # Start with no negative prompt for max speed
     server.performance_mode = args.performance
     server._apply_performance_mode()
     

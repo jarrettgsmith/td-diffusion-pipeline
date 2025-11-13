@@ -112,6 +112,14 @@ class PipelineConfig:
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
+    def __post_init__(self):
+        """Post-initialization validation and logging"""
+        if self.device == "cuda" and torch.cuda.is_available():
+            print(f"SUCCESS: CUDA device selected: {torch.cuda.get_device_name(0)}")
+            print(f"SUCCESS: CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        else:
+            print(f"WARNING: Using CPU device: {self.device}")
+    
 
 class StreamDiffusionPipeline:
     """
@@ -122,6 +130,19 @@ class StreamDiffusionPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.device = torch.device(config.device)
+        
+        # Validate CUDA setup
+        if self.device.type == "cuda":
+            if torch.cuda.is_available():
+                print(f"SUCCESS: CUDA enabled: {torch.cuda.get_device_name(0)}")
+                print(f"SUCCESS: VRAM available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+                torch.cuda.empty_cache()  # Clear cache
+            else:
+                print("WARNING: CUDA requested but not available, falling back to CPU")
+                self.device = torch.device("cpu")
+                config.device = "cpu"
+        else:
+            print(f"WARNING: Using CPU device: {self.device}")
         
         # Auto-detect optimal dtype
         if config.use_fp16 is None:
@@ -319,10 +340,13 @@ class StreamDiffusionPipeline:
             "euler_a": EulerAncestralDiscreteScheduler,
         }
         
-        # SD-Turbo optimized scheduler
+        # Use SD-Turbo's original scheduler configuration
+        # SD-Turbo was trained with specific settings that must be preserved
+        from diffusers import EulerAncestralDiscreteScheduler
         self.scheduler = EulerAncestralDiscreteScheduler.from_config(
             base_scheduler.config,
             timestep_spacing="trailing",
+            prediction_type="epsilon",  # SD-Turbo uses epsilon prediction
         )
             
     def _apply_optimizations(self):
@@ -331,8 +355,12 @@ class StreamDiffusionPipeline:
         # Memory format optimization
         if self.config.use_channels_last:
             self.unet = self.unet.to(memory_format=torch.channels_last)
-            # Skip channels_last for VAE - it might be causing NaN issues with SDXL
-            # self.vae = self.vae.to(memory_format=torch.channels_last)
+            # Also apply to VAE for SD-Turbo (safer than SDXL)
+            try:
+                self.vae = self.vae.to(memory_format=torch.channels_last)
+                print("SUCCESS: Channels-last memory format applied to UNet and VAE")
+            except Exception:
+                print("WARNING: Channels-last failed for VAE, using UNet only")
             
         # Attention optimization
         if self.config.acceleration == AccelerationType.XFORMERS:
@@ -492,19 +520,39 @@ class StreamDiffusionPipeline:
         
     @torch.no_grad()
     def encode_prompt(self, prompt: str, negative_prompt: str = ""):
-        """Encode text prompt to embeddings for SD-Turbo with caching"""
-        # Cache key for prompt embeddings
-        cache_key = f"{prompt}|{negative_prompt}"
-        if cache_key in self.text_embedding_cache:
-            return self.text_embedding_cache[cache_key]
-        
-        embeddings = self._encode_prompt_standard(prompt, negative_prompt)
-        
-        # Cache the result (limit cache size to prevent memory issues)
-        if len(self.text_embedding_cache) < 100:  # Limit cache size
-            self.text_embedding_cache[cache_key] = embeddings
-        
-        return embeddings
+        """Encode text prompt to embeddings for SD-Turbo with optimized caching"""
+        # Optimize: if no negative prompt, use simple cache key and skip negative encoding
+        if not negative_prompt or not negative_prompt.strip():
+            if prompt in self.text_embedding_cache:
+                cached_pos, cached_neg = self.text_embedding_cache[prompt]
+                return cached_pos, cached_neg
+            
+            # Only encode positive prompt
+            embeddings = self._encode_prompt_standard(prompt, "")
+            
+            # Always cache for common prompts (they repeat frequently)
+            if len(self.text_embedding_cache) < 10:  # Keep cache small but effective
+                self.text_embedding_cache[prompt] = embeddings
+            elif prompt not in self.text_embedding_cache:
+                # Replace oldest entry
+                oldest_key = next(iter(self.text_embedding_cache))
+                del self.text_embedding_cache[oldest_key]
+                self.text_embedding_cache[prompt] = embeddings
+            
+            return embeddings
+        else:
+            # Full cache key for both prompts
+            cache_key = f"{prompt}|{negative_prompt}"
+            if cache_key in self.text_embedding_cache:
+                return self.text_embedding_cache[cache_key]
+            
+            embeddings = self._encode_prompt_standard(prompt, negative_prompt)
+            
+            # Cache CFG results too but with smaller limit
+            if len(self.text_embedding_cache) < 5:
+                self.text_embedding_cache[cache_key] = embeddings
+            
+            return embeddings
             
     def _encode_prompt_standard(self, prompt: str, negative_prompt: str):
         """SD-Turbo optimized prompt encoding"""
@@ -568,6 +616,7 @@ class StreamDiffusionPipeline:
     def stream_generate(
         self,
         prompt: str,
+        negative_prompt: str = "",
         image: Optional[Union[Image.Image, torch.Tensor]] = None,
         strength: float = 0.8,
         seed: Optional[int] = None,
@@ -590,11 +639,19 @@ class StreamDiffusionPipeline:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(seed)
         
-        # Encode prompt once
-        prompt_embeds, negative_embeds = self.encode_prompt(prompt)
+        # Encode prompt with aggressive caching
+        prompt_embeds, negative_embeds = self.encode_prompt(prompt, negative_prompt)
+        
+        # For SD-Turbo with negative prompts, use low guidance
+        # Only enable CFG when negative prompt is actually provided
+        if negative_prompt and negative_prompt.strip():
+            guidance_scale = 1.5  # Low guidance for SD-Turbo with negative prompts
+            # print(f"DEBUG: Using CFG with guidance_scale={guidance_scale}")
+        else:
+            guidance_scale = 0.0  # No guidance = much faster
         
         # For CFG, concatenate embeddings like diffusers does
-        if self.config.guidance_scale > 1.0:
+        if guidance_scale > 1.0:
             text_embeddings = torch.cat([negative_embeds, prompt_embeds])
         else:
             text_embeddings = prompt_embeds
@@ -606,14 +663,16 @@ class StreamDiffusionPipeline:
         else:
             latents = self._prepare_latents(generator=generator)
             
-        # Setup timesteps based on model
-        timesteps = self._get_timesteps(strength if image else 1.0)
+        # Always set timesteps to ensure scheduler internal state is correct
+        # This is needed for EulerAncestralDiscreteScheduler to work properly
+        self.scheduler.set_timesteps(self.config.num_inference_steps)
+        timesteps = self.scheduler.timesteps
         
         # Streaming loop
         for i, t in enumerate(timesteps):
             
             # For CFG, duplicate latents to match concatenated embeddings
-            if self.config.guidance_scale > 1.0:
+            if guidance_scale > 1.0:
                 latent_model_input = torch.cat([latents] * 2)
             else:
                 latent_model_input = latents
@@ -653,10 +712,14 @@ class StreamDiffusionPipeline:
                         added_cond_kwargs=added_cond_kwargs,
                     ).sample
                     
+                # Debug: Check device usage (disabled for production)
+                # if i == 0:  # Only log first step
+                #     print(f"DEBUG: UNet inference on {latent_model_input.device}, output on {noise_pred.device}")
+                    
             # Perform guidance (split predictions and apply CFG)
-            if self.config.guidance_scale > 1.0:
+            if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.config.guidance_scale * (
+                noise_pred = noise_pred_uncond + guidance_scale * (
                     noise_pred_text - noise_pred_uncond
                 )
                 
@@ -815,69 +878,47 @@ class StreamDiffusionPipeline:
         return latents
         
     def _add_noise(self, latents: torch.Tensor, strength: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
-        """Add noise to latents for image-to-image"""
-        # randn_like doesn't support generator, so use randn with same shape
-        noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
-        
-        # Only set timesteps if they changed to avoid expensive recreation
-        if self._last_num_steps != self.config.num_inference_steps:
-            self.scheduler.set_timesteps(self.config.num_inference_steps)
-            self._last_num_steps = self.config.num_inference_steps
-        
-        # Calculate how many denoising steps to skip based on strength
-        init_timestep = min(int(self.config.num_inference_steps * strength), self.config.num_inference_steps)
-        
-        # Get the appropriate timestep for noise addition
-        timesteps = self.scheduler.timesteps
-        if init_timestep == 0:
-            # No noise if strength is 0
+        """SD-Turbo simplified noise addition - strength controls initial noise level only"""
+        if strength == 0.0:
             return latents
-        elif init_timestep >= len(timesteps):
-            # Use the highest noise timestep if strength is high
-            timestep = timesteps[0]
-        else:
-            # Use the appropriate timestep from the end of the schedule
-            timestep = timesteps[-init_timestep]
         
-        # Convert to tensor with proper batch dimension
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.unsqueeze(0) if timestep.dim() == 0 else timestep
-        else:
-            timestep = torch.tensor([timestep], device=self.device, dtype=torch.long)
+        # print(f"DEBUG _add_noise: strength={strength:.3f}, latents_shape={latents.shape}")
         
-        # Ensure timestep has the right batch size
-        if timestep.shape[0] != latents.shape[0]:
-            timestep = timestep.repeat(latents.shape[0])
-        
-        try:
-            # Try using the scheduler's add_noise method
-            latents = self.scheduler.add_noise(latents, noise, timestep)
-        except Exception as e:
-            print(f"WARNING: Scheduler add_noise failed ({e}), using manual noise blending")
-            # Fallback: Manual noise blending based on strength
-            # This ensures we always get reasonable results even if scheduler fails
-            alpha = 1.0 - strength  # How much of original to keep
-            latents = alpha * latents + strength * noise
+        # For SD-Turbo, just scale the input latents by strength
+        # This is much simpler and more predictable than noise interpolation
+        if strength >= 1.0:
+            # Full noise replacement - use pre-allocated noise for consistency
+            if not hasattr(self, '_noise_cache') or self._noise_cache.shape != latents.shape:
+                self._noise_cache = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
             
-        return latents
+            if generator is not None:
+                # Use generator for deterministic noise
+                noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
+            else:
+                # Reuse cached noise for speed (non-deterministic mode)
+                noise = self._noise_cache + torch.randn_like(self._noise_cache) * 0.1  # Add slight variation
+            return noise
+        else:
+            # Smooth interpolation between input and noise for better gradual transitions
+            if generator is not None:
+                noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
+            else:
+                noise = torch.randn_like(latents)
+                
+            if strength < 0.1:
+                # For very low strength, preserve most of original
+                return latents * (1.0 - strength) + noise * strength * 0.3
+            else:
+                # Standard interpolation between input latents and noise
+                return latents * (1.0 - strength) + noise * strength
         
     def _get_timesteps(self, strength: float) -> torch.Tensor:
-        """Get timesteps based on scheduler and strength"""
-        # Always set timesteps to ensure scheduler state is correct
+        """SD-Turbo uses fixed timestep schedules - don't modify based on strength"""
+        # For SD-Turbo, always use the full timestep schedule
+        # Strength control happens via noise/latent scaling, not timestep modification
         self.scheduler.set_timesteps(self.config.num_inference_steps)
         self._last_num_steps = self.config.num_inference_steps
-        
-        if strength < 1.0:
-            # For image-to-image, skip some timesteps
-            init_timestep = min(
-                int(self.config.num_inference_steps * strength),
-                self.config.num_inference_steps
-            )
-            timesteps = self.scheduler.timesteps[-init_timestep:]
-        else:
-            timesteps = self.scheduler.timesteps
-            
-        return timesteps
+        return self.scheduler.timesteps
         
     def warmup(self):
         """Warmup the pipeline for optimal performance"""
