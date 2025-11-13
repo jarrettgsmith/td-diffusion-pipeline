@@ -127,15 +127,18 @@ class SpoutDiffusionServer:
                 print(f"SUCCESS: CUBLAS_WORKSPACE_CONFIG={cublas_config}")
                 
             try:
-                # SELECTIVE DETERMINISM: Only enable critical settings for video work
+                # Strict determinism settings
                 torch.backends.cudnn.deterministic = True
-                # Keep benchmark=True for performance (slight non-determinism but faster)
-                torch.backends.cudnn.benchmark = True  
-                
-                # Keep TF32 enabled for performance (video doesn't need perfect determinism)
-                # Strict determinism hurts performance significantly
-                print("SUCCESS: Video-optimized deterministic mode configured")
-                print("NOTE: Prioritizing video performance over perfect mathematical determinism")
+                torch.backends.cudnn.benchmark = False
+                if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                if hasattr(torch.backends, 'cudnn'):
+                    torch.backends.cudnn.allow_tf32 = False
+                try:
+                    torch.use_deterministic_algorithms(True)
+                except Exception:
+                    pass
+                print("SUCCESS: Deterministic mode configured (cudnn.deterministic=True, benchmark=False, TF32 off)")
             except Exception as e:
                 print(f"WARNING: Deterministic mode setup failed: {e}")
         
@@ -205,6 +208,21 @@ class SpoutDiffusionServer:
             
             if self.deterministic:
                 self._configure_deterministic_attention()
+            else:
+                # Global fast-path settings for non-deterministic mode
+                if torch.cuda.is_available():
+                    try:
+                        if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+                            torch.backends.cuda.matmul.allow_tf32 = True
+                        if hasattr(torch.backends, 'cudnn'):
+                            torch.backends.cudnn.allow_tf32 = True
+                            torch.backends.cudnn.benchmark = True
+                        try:
+                            torch.set_float32_matmul_precision('high')
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         
         # Setup OSC server
         self.setup_osc_server()
@@ -427,9 +445,7 @@ class SpoutDiffusionServer:
                     self.pipe.config.num_inference_steps
                 )
                 
-                # Debug logging to verify strength values
-                if self.frame_count % 30 == 0:
-                    print(f"DEBUG: OSC strength={self.current_strength:.3f} -> effective={effective_strength:.3f}, steps={recommended_steps}")
+                # Debug logging removed for performance
                 
                 # Update pipeline steps if changed (OSC control)
                 if hasattr(self.pipe, 'config') and self.pipe.config.num_inference_steps != recommended_steps:
@@ -453,11 +469,12 @@ class SpoutDiffusionServer:
                     # Reuse pre-allocated RGBA buffer when possible
                     if self.output_rgba_buffer is None or self.current_buffer_size != (height, width):
                         self.output_rgba_buffer = np.empty((height, width, 4), dtype=np.uint8)
+                        # Pre-fill alpha once
+                        self.output_rgba_buffer[:, :, 3] = 255
                         self.current_buffer_size = (height, width)
                     
                     # Fill buffer efficiently (no allocation)
                     self.output_rgba_buffer[:, :, :3] = output_array  # RGB channels
-                    self.output_rgba_buffer[:, :, 3] = 255  # Alpha channel
                     
                     # Return buffer directly (no blending)
                     return self.output_rgba_buffer

@@ -693,63 +693,47 @@ class StreamDiffusionPipeline:
             timesteps_to_run = timesteps
         
         # Streaming loop over selected timesteps (Euler A expects full range for each run)
-        for i, t in enumerate(timesteps_to_run):
-            
-            # For CFG, duplicate latents to match concatenated embeddings
-            if guidance_scale > 1.0:
-                latent_model_input = torch.cat([latents] * 2)
-            else:
-                latent_model_input = latents
-            
-            # Scale latents if needed (for some schedulers)
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-            
-            # Predict noise residual
-            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                # SD-Turbo doesn't need additional conditioning
-                added_cond_kwargs = {}
-                
-                # Validate tensors before UNet call (debug mode)
-                validation_tensors = {
-                    "latent_model_input": latent_model_input,
-                    "text_embeddings": text_embeddings,
-                }
-                if added_cond_kwargs:
-                    validation_tensors.update(added_cond_kwargs)
-                
-                # Only validate on first timestep to avoid spam (disable for demo)
-                # if i == 0:
-                #     self._validate_tensors(validation_tensors, f"UNet call step {i}")
-                
-                if self.compiled_unet:
-                    noise_pred = self.compiled_unet(
-                        latent_model_input,
-                        t.to(self.dtype),
-                        encoder_hidden_states=text_embeddings,
-                        added_cond_kwargs=added_cond_kwargs,
-                    ).sample
+        with torch.inference_mode():
+            for i, t in enumerate(timesteps_to_run):
+                # For CFG, duplicate latents to match concatenated embeddings
+                if guidance_scale > 1.0:
+                    latent_model_input = torch.cat([latents] * 2)
                 else:
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t.to(self.dtype),
-                        encoder_hidden_states=text_embeddings,
-                        added_cond_kwargs=added_cond_kwargs,
-                    ).sample
-                    
-                # Debug: Check device usage (disabled for production)
-                # if i == 0:  # Only log first step
-                #     print(f"DEBUG: UNet inference on {latent_model_input.device}, output on {noise_pred.device}")
-                    
-            # Perform guidance (split predictions and apply CFG)
-            if guidance_scale > 1.0:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
-                )
-                
-            # Compute previous noisy sample x_{t-1}
-            scheduler_output = self.scheduler.step(noise_pred, t, latents)
-            latents = scheduler_output.prev_sample
+                    latent_model_input = latents
+
+                # Scale latents if needed (for some schedulers)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # Predict noise residual
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    # SD-Turbo doesn't need additional conditioning
+                    added_cond_kwargs = {}
+
+                    if self.compiled_unet:
+                        noise_pred = self.compiled_unet(
+                            latent_model_input,
+                            t.to(self.dtype),
+                            encoder_hidden_states=text_embeddings,
+                            added_cond_kwargs=added_cond_kwargs,
+                        ).sample
+                    else:
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t.to(self.dtype),
+                            encoder_hidden_states=text_embeddings,
+                            added_cond_kwargs=added_cond_kwargs,
+                        ).sample
+
+                # Perform guidance (split predictions and apply CFG)
+                if guidance_scale > 1.0:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+
+                # Compute previous noisy sample x_{t-1}
+                scheduler_output = self.scheduler.step(noise_pred, t, latents)
+                latents = scheduler_output.prev_sample
             
             # Debug latent values after scheduler step (disable for demo)
             # if i == 0:
@@ -848,6 +832,11 @@ class StreamDiffusionPipeline:
         if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.uint8:
             tensor = tensor.to(dtype=torch.float32).div_(255.0)
 
+        # Convert to target dtype on CPU to reduce H2D bandwidth
+        target_dtype = self.dtype
+        if tensor.dtype != target_dtype:
+            tensor = tensor.to(dtype=target_dtype)
+
         # Pin memory for faster H2D when on CUDA
         non_blocking = self.device.type == "cuda"
         try:
@@ -856,7 +845,7 @@ class StreamDiffusionPipeline:
         except Exception:
             pass
 
-        image = tensor.to(self.device, dtype=self.dtype, non_blocking=non_blocking)
+        image = tensor.to(self.device, non_blocking=non_blocking)
 
         # Normalize to [-1, 1]
         image = 2.0 * image - 1.0
